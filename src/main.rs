@@ -1,13 +1,19 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{self, Read, Write, Seek, SeekFrom, BufReader, BufWriter};
+use std::path::{Path, PathBuf};
+use std::cmp::Ordering;
+use std::time::Instant;
 use clap::{Parser, Subcommand, ValueEnum};
 use crossbeam_channel as channel;
 use rayon::prelude::*;
+use log::{info, error, debug};
+use csv::{ReaderBuilder, WriterBuilder, StringRecord, Reader, Writer};
+use serde::Deserialize;
 
 const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks for processing
+const DEFAULT_CSV_ROWS: usize = 10_000; // Default rows per split file
 
-/// A tool for splitting and merging files with parallel processing
+/// A tool for splitting and merging CSV files with parallel processing
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -17,193 +23,231 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Merge multiple files into one
+    /// Merge multiple CSV files into one
     Merge {
-        /// Output file path
+        /// Output CSV file path
         output: String,
         
-        /// Input files to merge
+        /// Comma-separated list of columns to sort by
+        #[arg(short = 's', long, default_value = "")]
+        sort_by: String,
+        
+        /// Input CSV files to merge
         #[arg(required = true)]
         input_files: Vec<String>,
     },
     
-    /// Split a file into multiple smaller files
+    /// Split a CSV file into multiple smaller files
     Split {
-        /// Input file to split
+        /// Input CSV file to split
         input: String,
         
         /// Output directory for split files
         output_dir: String,
         
-        /// Maximum size of each split file in MB
-        #[arg(short, long, default_value_t = 10)]
-        size: usize,
+        /// Maximum number of rows per split file
+        #[arg(short = 'r', long, default_value_t = DEFAULT_CSV_ROWS)]
+        rows: usize,
+        
+        /// Comma-separated list of columns to sort by
+        #[arg(short = 's', long, default_value = "")]
+        sort_by: String,
         
         /// Number of parallel workers (0 = auto-detect)
-        #[arg(short, long, default_value_t = 0)]
+        #[arg(short = 'w', long, default_value_t = 0)]
         workers: usize,
     },
 }
 
-/// Merges multiple files into a single output file using parallel processing.
-///
-/// # Arguments
-/// * `input_files` - A vector of input file paths to merge
-/// * `output_file` - The path where the merged content will be written
-///
-/// # Returns
-/// * `Result<(), io::Error>` - Ok(()) on success, or an IO error
-fn merge_files(input_files: &[String], output_file: &str) -> io::Result<()> {
-    // Create output file first to ensure we can write
-    let _ = File::create(output_file)?;
+/// Reads records from a CSV file
+fn read_csv_records(file_path: &str) -> io::Result<(Option<StringRecord>, Vec<StringRecord>)> {
+    let file = File::open(file_path)?;
+    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
+    let headers = Some(rdr.headers()?.clone());
+    let records = rdr.records().collect::<Result<Vec<_>, _>>()?;
+    Ok((headers, records))
+}
+
+/// Sorts records based on specified columns
+fn sort_records(records: &mut [StringRecord], headers: &StringRecord, sort_columns: &[&str]) {
+    if sort_columns.is_empty() {
+        return;
+    }
     
-    // Process files in parallel and collect their contents
-    let contents: io::Result<Vec<Vec<u8>>> = input_files
-        .par_iter()
-        .map(|file_path| {
-            let mut file = File::open(file_path)?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)?;
-            Ok(buffer)
-        })
+    let column_indices: Vec<usize> = sort_columns
+        .iter()
+        .filter_map(|col| headers.iter().position(|h| h == *col))
         .collect();
     
-    // Write contents to output file
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open(output_file)?;
-    
-    for (i, content) in contents?.into_iter().enumerate() {
-        output.write_all(&content)?;
-        // Add newline between files if not present
-        if i < input_files.len() - 1 && !content.ends_with(&[b'\n']) {
-            output.write_all(b"\n")?;
+    records.sort_by(|a, b| {
+        for &idx in &column_indices {
+            match (a.get(idx), b.get(idx)) {
+                (Some(a_val), Some(b_val)) => {
+                    let ord = a_val.cmp(b_val);
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+                _ => continue,
+            }
         }
+        Ordering::Equal
+    });
+}
+
+/// Writes records to a CSV file
+fn write_csv_records(
+    output_path: &Path,
+    headers: Option<&StringRecord>,
+    records: &[StringRecord],
+) -> io::Result<()> {
+    let output = File::create(output_path)?;
+    let mut wtr = WriterBuilder::new().from_writer(output);
+    
+    if let Some(headers) = headers {
+        wtr.write_record(headers)?;
+    }
+    
+    for record in records {
+        wtr.write_record(record)?;
+    }
+    
+    wtr.flush()?;
+    Ok(())
+}
+
+/// Merges multiple CSV files into a single output file with optional sorting
+///
+/// # Arguments
+/// * `input_files` - A vector of input CSV file paths to merge
+/// * `output_file` - The path where the merged CSV will be written
+/// * `sort_columns` - List of column names to sort by (empty for no sorting)
+///
+/// # Returns
+/// * `io::Result<()>` - Ok(()) on success, or an IO error
+fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&str]) -> io::Result<()> {
+    info!("Merging CSV files into {}", output_file);
+
+    let start_time = Instant::now();
+    info!("Starting merge operation...");
+    
+    let mut all_records = Vec::new();
+    let mut headers = None;
+    
+    // Read all records from input files
+    for file_path in input_files {
+        info!("Reading CSV file: {}", file_path);
+        let (file_headers, mut records) = read_csv_records(file_path)?;
+        
+        // Get headers from first file
+        if headers.is_none() {
+            headers = file_headers;
+        }
+        
+        all_records.append(&mut records);
+    }
+    
+    // Sort records if sort columns are specified
+    if let Some(ref headers) = headers {
+        sort_records(&mut all_records, headers, sort_columns);
+    }
+    
+    // Write sorted records to output file
+    if let Ok(t) =  write_csv_records(Path::new(output_file), headers.as_ref(), &all_records) {
+        let duration = start_time.elapsed();
+        info!("Merge completed in {:.2?}", duration);
+    } else {
+        error!("Failed to write records to output file: {}", output_file);
+        return Err(io::Error::new(io::ErrorKind::Other, "Failed to write output file"));
     }
     
     Ok(())
 }
 
-/// Splits a file into multiple smaller files using parallel processing.
+/// Splits a CSV file into multiple smaller files with optional sorting
 ///
 /// # Arguments
-/// * `input_file` - Path to the file to split
-/// * `output_dir` - Directory where the split files will be saved
-/// * `max_size_mb` - Maximum size of each split file in MB
+/// * `input_file` - Path to the input CSV file
+/// * `output_dir` - Directory where split files will be saved
+/// * `rows_per_file` - Maximum number of rows per output file
+/// * `sort_columns` - List of column names to sort by (empty for no sorting)
 ///
 /// # Returns
-/// * `Result<Vec<String>, io::Error>` - Vector of generated file paths, or an IO error
-fn split_file(input_file: &str, output_dir: &str, max_size_mb: usize) -> io::Result<Vec<String>> {
-    // Create output directory if it doesn't exist
+/// * `io::Result<()>` - Ok(()) on success, or an IO error
+fn split_csv_file(input_file: &str, output_dir: &str, rows_per_file: usize, sort_columns: &[&str]) -> io::Result<()> {
+    info!("Splitting CSV file: {}", input_file);
+    let start_time = Instant::now();
+    info!("Starting split operation...");
+    
     fs::create_dir_all(output_dir)?;
     
-    let file_path = Path::new(input_file);
-    let file_stem = file_path.file_stem()
+    // Read all records and headers
+    let (headers_opt, mut all_records) = read_csv_records(input_file)?;
+    let headers = headers_opt.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "No headers found in CSV file")
+    })?;
+    
+    // Sort records if sort columns are specified
+    if !sort_columns.is_empty() {
+        info!("Sorting records by columns: {:?}", sort_columns);
+        sort_records(&mut all_records, &headers, sort_columns);
+    }
+    
+    // Generate output file name components
+    let file_stem = Path::new(input_file)
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("split");
-    let extension = file_path.extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
     
-    let file = File::open(input_file)?;
-    let file_size = file.metadata()?.len() as usize;
-    let max_chunk_size = max_size_mb * 1024 * 1024; // Convert MB to bytes
-    
-    // Calculate number of chunks needed
-    let num_chunks = (file_size + max_chunk_size - 1) / max_chunk_size;
-    
-    // Create a channel for collecting results
-    let (tx, rx) = channel::bounded(num_chunks);
-    
-    // Process each chunk in parallel
-    (0..num_chunks).into_par_iter().for_each_with((tx, file_path.to_path_buf()), |(sender, _), i| {
-        let output_path = format!(
-            "{}/{}_{:03}.{}",
-            output_dir,
-            file_stem,
-            i + 1,
-            if !extension.is_empty() { extension } else { "bin" }
-        );
+    // Write chunks to separate files
+    for (i, chunk) in all_records.chunks(rows_per_file).enumerate() {
+        let output_path = format!("{}/{}_part_{:04}.csv", output_dir, file_stem, i + 1);
+        info!("Writing chunk {} with {} records to {}", i + 1, chunk.len(), output_path);
         
-        // Process each chunk in its own thread
-        let result = process_chunk(
-            input_file,
-            &output_path,
-            i * max_chunk_size,
-            max_chunk_size
-        );
-        
-        // Send the result back
-        let _ = sender.send(match result {
-            Ok(path) => Ok(path),
-            Err(e) => Err(e.to_string())
-        });
-    });
-    
-    // Collect results
-    let mut output_files = Vec::with_capacity(num_chunks);
-    for result in rx {
-        match result {
-            Ok(path) => output_files.push(path),
-            Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
-        }
+        write_csv_records(Path::new(&output_path), Some(&headers), chunk)?;
     }
     
-    Ok(output_files)
-}
-
-/// Processes a single chunk of the file
-fn process_chunk(input_file: &str, output_path: &str, offset: usize, chunk_size: usize) -> io::Result<String> {
-    let mut input = File::open(input_file)?;
-    let mut output = File::create(output_path)?;
+    let num_files = (all_records.len() + rows_per_file - 1) / rows_per_file;
+    info!("Successfully split into {} files", num_files);
+    let duration = start_time.elapsed();
+    info!("Split completed in {:.2?}", duration);
     
-    // Seek to the start of the chunk
-    input.seek(SeekFrom::Start(offset as u64))?;
-    
-    // Read and write in smaller chunks to control memory usage
-    let mut buffer = vec![0; CHUNK_SIZE.min(chunk_size)];
-    let mut remaining = chunk_size;
-    
-    while remaining > 0 {
-        let read_size = buffer.len().min(remaining);
-        let read = input.read(&mut buffer[..read_size])?;
-        if read == 0 { break; } // End of file
-        
-        output.write_all(&buffer[..read])?;
-        remaining = remaining.saturating_sub(read);
-    }
-    
-    Ok(output_path.to_string())
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
+    pretty_env_logger::init();
+    info!("Starting CSV split/merge tool");
+
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Merge { output, input_files } => {
+        Commands::Merge { output, sort_by, input_files } => {
             if input_files.is_empty() {
-                eprintln!("Error: No input files specified");
+                error!("No input files specified");
                 return Ok(());
             }
+
+            let sort_columns: Vec<&str> = sort_by.split(',').filter(|s| !s.is_empty()).collect();
+            info!("Merging {} files sorted by {:?}", input_files.len(), sort_columns);
             
-            println!("Merging {} files into {}...", input_files.len(), output);
-            merge_files(&input_files, &output)?;
-            println!("✓ Successfully merged {} files into {}", input_files.len(), output);
+            merge_csv_files(&input_files, &output, &sort_columns)?;
+            info!("Successfully merged files into {}", output);
         },
-        Commands::Split { input, output_dir, size, workers } => {
-            // Set number of worker threads if specified
+        Commands::Split { input, output_dir, rows, sort_by, workers } => {
             if workers > 0 {
+                debug!("Setting up thread pool with {} workers", workers);
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(workers)
                     .build_global()
-                    .expect("Failed to initialize thread pool");
+                    .unwrap_or_else(|e| error!("Failed to initialize thread pool: {}", e));
             }
+
+            let sort_columns: Vec<&str> = sort_by.split(',').filter(|s| !s.is_empty()).collect();
+            info!("Splitting {} into chunks of {} rows sorted by {:?}", 
+                  input, rows, sort_columns);
             
-            println!("Splitting {} into {}MB chunks in directory {}...", input, size, output_dir);
-            let output_files = split_file(&input, &output_dir, size)?;
-            println!("✓ Successfully split {} into {} parts in directory {}", 
-                    input, output_files.len(), output_dir);
+            split_csv_file(&input, &output_dir, rows, &sort_columns)?;
         },
     }
     

@@ -26,6 +26,7 @@ target/
 /target
 /.idea/*
 /split_output/*
+/test_data/*
 /merged.txt
 /file2.txt
 /merged_large.bin
