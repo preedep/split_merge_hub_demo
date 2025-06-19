@@ -24,5 +24,11 @@ target/
 # Added by cargo
 
 /target
-/.idea/material_theme_project_new.xml
-/.idea/.gitignore
+/.idea/*
+/split_output/*
+/merged.txt
+/file2.txt
+/merged_large.bin
+/large_file.bin
+/file3.txt
+/file1.txt
