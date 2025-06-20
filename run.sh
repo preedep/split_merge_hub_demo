@@ -2,7 +2,7 @@
 set -e
 
 # Set log level
-export RUST_LOG=info
+export RUST_LOG=debug
 
 # Build the project
 echo "Building the project..."
