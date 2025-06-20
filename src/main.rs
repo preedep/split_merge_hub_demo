@@ -1,3 +1,5 @@
+mod main_mockup;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder, Writer};
