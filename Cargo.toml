@@ -5,15 +5,16 @@ edition = "2024"
 
 [[bin]]
 name = "split_merge_hub_demo"
-path = "src/main.rs"
+path = "src/bin/main.rs"
 
 [[bin]]
-name = "mock_split_merge_hub"
-path = "src/main_mockup.rs"
+name = "generate_large_files"
+path = "src/bin/generate_large_files.rs"
 
 
 [dependencies]
 clap = { version = "4.5.40", features = ["derive"] }
+humansize = "2.1"
 pretty_env_logger = "0.5"
 log = "0.4"
 csv = { version = "1.3" }
