@@ -5,7 +5,6 @@ use rand::Rng;
 use std::time::Instant;
 
 const TARGET_SIZE_GB: u64 = 5;
-const RECORD_SIZE: usize = 50; // Approximate size per record in bytes
 const RECORDS_PER_BATCH: usize = 10_000;
 
 fn main() -> Result<()> {

@@ -1,104 +1,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use csv::{ReaderBuilder, StringRecord, Writer, WriterBuilder};
-use log::{debug, error, info};
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use log::info;
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tempfile::{tempdir, TempDir};
 
-// Constants for memory management
-const DEFAULT_CSV_ROWS: usize = 100_000; // Default rows per split file
-
-// Structure to hold sorted chunks for external sorting
-struct SortedChunk {
-    reader: Option<csv::Reader<File>>,
-    current_record: Option<StringRecord>,
-}
-/// A sorted chunk of records for external sorting.
-///
-/// This is used to sort records in parallel and merge them in a sorted order.
-///
-/// The `reader` field contains the CSV reader for the chunk.
-/// The `current_record` field contains the next record in the chunk.
-impl SortedChunk {
-    fn new(path: PathBuf) -> Result<Self> {
-        let file = File::open(&path).context("Failed to open chunk file")?;
-        let mut reader = ReaderBuilder::new().has_headers(false).from_reader(file);
-
-        let current_record = match reader.records().next() {
-            Some(Ok(record)) => Some(record),
-            Some(Err(e)) => return Err(anyhow::anyhow!("Failed to read record: {}", e)),
-            None => None,
-        };
-
-        Ok(Self {
-            reader: Some(reader),
-            current_record,
-        })
-    }
-
-    fn next_record(&mut self) -> Result<Option<StringRecord>> {
-        if let Some(record) = self.current_record.take() {
-            // Get the next record if available
-            if let Some(reader) = &mut self.reader {
-                self.current_record = match reader.records().next() {
-                    Some(Ok(rec)) => Some(rec),
-                    Some(Err(e)) => {
-                        return Err(anyhow::anyhow!("Failed to read next record: {}", e));
-                    }
-                    None => None,
-                };
-            }
-            Ok(Some(record))
-        } else {
-            Ok(None)
-        }
-    }
-}
-/// Implements traits required for sorting chunks in a min-heap
-impl Ord for SortedChunk {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse ordering for min-heap
-        match (&self.current_record, &other.current_record) {
-            (Some(a), Some(b)) => {
-                // Compare string representations for simplicity
-                let a_str: String = a.iter().collect::<String>();
-                let b_str: String = b.iter().collect::<String>();
-                b_str.cmp(&a_str) // Reverse order for min-heap
-            }
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        }
-    }
-}
-
-impl PartialOrd for SortedChunk {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for SortedChunk {
-    fn eq(&self, other: &Self) -> bool {
-        match (&self.current_record, &other.current_record) {
-            (Some(a), Some(b)) => a == b,
-            (None, None) => true,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for SortedChunk {}
-
-// Helper function to create a temporary directory that will be cleaned up automatically
-fn create_temp_dir() -> Result<TempDir> {
-    tempdir().context("Failed to create temporary directory")
-}
-
+use split_merge_hub_demo::parallel_merge::parallel_merge_sort;
+use rayon::slice::ParallelSliceMut;
 /// A tool for splitting and merging CSV files with parallel processing
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -111,542 +21,88 @@ struct Cli {
 enum Commands {
     /// Merge multiple CSV files into one
     Merge {
-        /// Output CSV file path
-        output: String,
-
-        /// Comma-separated list of columns to sort by
-        #[arg(short = 's', long, default_value = "")]
-        sort_by: String,
-
         /// Input CSV files to merge
         #[arg(required = true)]
         input_files: Vec<String>,
+        
+        /// Output file path
+        #[arg(short, long)]
+        output: String,
+        
+        /// Columns to sort by (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        sort_by: Vec<String>,
+        
+        /// Chunk size in MB for processing large files
+        #[arg(long, default_value = "500")]
+        chunk_size: usize,
     },
-
-    /// Split a CSV file into multiple smaller files
+    
+    /// Split a CSV file into smaller chunks
     Split {
         /// Input CSV file to split
-        input: String,
-
+        input_file: String,
+        
         /// Output directory for split files
+        #[arg(short, long, default_value = "split_files")]
         output_dir: String,
-
-        /// Maximum number of rows per split file
-        #[arg(short = 'r', long, default_value_t = DEFAULT_CSV_ROWS)]
-        rows: usize,
-
-        /// Comma-separated list of columns to sort by
-        #[arg(short = 's', long, default_value = "")]
-        sort_by: String,
-
-        /// Number of parallel workers (0 = auto-detect)
-        #[arg(short = 'w', long, default_value_t = 0)]
-        workers: usize,
+        
+        /// Maximum number of rows per file
+        #[arg(short, long, default_value = "10000")]
+        rows_per_file: usize,
+        
+        /// Columns to sort by (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        sort_by: Vec<String>,
     },
 }
 
-/// Compares two records based on the specified column indices
-fn compare_records(a: &StringRecord, b: &StringRecord, column_indices: &[usize]) -> Ordering {
-    for &idx in column_indices {
-        match (a.get(idx), b.get(idx)) {
-            (Some(a_val), Some(b_val)) => {
-                let ord = a_val.cmp(b_val);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            _ => continue,
-        }
+fn main() -> Result<()> {
+    pretty_env_logger::init();
+    
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Commands::Merge { input_files, output, sort_by, chunk_size } => {
+            // Set chunk size environment variable for the parallel merge
+            std::env::set_var("CHUNK_SIZE_MB", chunk_size.to_string());
+            let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
+            merge_csv_files(&input_files, &output, &sort_columns)
+        },
+        Commands::Split { input_file, output_dir, rows_per_file, sort_by } => {
+            let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
+            split_csv_file(&input_file, &output_dir, rows_per_file, &sort_columns)
+        },
     }
-    Ordering::Equal
-}
-
-/// Sorts a chunk of CSV records based on specified column indices and writes the sorted chunk to a temporary file.
-///
-/// # Parameters
-///
-/// - `chunk`: A vector of `StringRecord` representing a chunk of CSV records to sort and write.
-/// - `column_indices`: A slice of column indices (`&[usize]`) that determines the sort order. Records are sorted
-///   by the values in these columns, in the order they appear in the slice.
-/// - `temp_dir`: A reference to a `Path` specifying the directory where the temporary file for the sorted chunk
-///   will be written.
-/// - `chunk_num`: An integer (`usize`) representing the index or number of the chunk. This is used to name
-///   the corresponding temporary file uniquely.
-///
-/// # Returns
-///
-/// Returns a `Result<PathBuf>`:
-/// - On success, returns the path to the temporary file where the sorted chunk is written.
-/// - On error, returns an error wrapped in a `Result` (e.g., if sorting or file I/O operations fail).
-///
-/// # Errors
-///
-/// - Returns an error if the temporary file cannot be created (e.g., due to permission issues or invalid path).
-/// - Returns an error if writing a record to the file fails.
-/// - Returns an error if flushing the writer buffer fails.
-///
-/// # Notes
-///
-/// - This function assumes that the input vector `chunk` contains `StringRecord` objects with enough columns
-///   for the provided `column_indices` to be valid.
-/// - The temporary file is created in the specified `temp_dir` and is named in the format "chunk_{chunk_num}.csv".
-/// - No headers are added to the temporary file as the writer is configured to exclude headers.
-///
-/// # Example
-///
-/// ```rust
-/// use csv::{ReaderBuilder, StringRecord, WriterBuilder};
-/// use std::fs::File;
-/// use std::path::Path;
-/// use tempfile::tempdir;
-///
-/// let temp_dir = tempdir().unwrap();
-/// let chunk = vec![
-///     StringRecord::from(vec!["2", "b"]),
-///     StringRecord::from(vec!["1", "a"])
-/// ];
-/// let column_indices = &[0]; // Sort by the first column.
-///
-/// let chunk_path = sort_and_write_chunk(chunk, column_indices, temp_dir.path(), 1).unwrap();
-/// assert!(chunk_path.exists());
-/// ```
-///
-/// # Dependencies
-///
-/// - `csv`: For working with CSV records and files.
-/// - `anyhow`: For error handling with context messages.
-///
-/// # See Also
-///
-/// - `compare_records`: Utility function used to compare records based on column indices.
-fn sort_and_write_chunk(
-    mut chunk: Vec<StringRecord>,
-    column_indices: &[usize],
-    temp_dir: &Path,
-    chunk_num: usize,
-) -> Result<PathBuf> {
-    // Sort the chunk
-    chunk.sort_by(|a, b| compare_records(a, b, column_indices));
-
-    // Write sorted chunk to temporary file
-    let chunk_path = temp_dir.join(format!("chunk_{}.csv", chunk_num));
-    let mut wtr = WriterBuilder::new()
-        .has_headers(false)
-        .from_path(&chunk_path)
-        .context("Failed to create chunk file")?;
-
-    for record in &chunk {
-        wtr.write_record(record)
-            .context("Failed to write record to chunk")?;
-    }
-    wtr.flush().context("Failed to flush chunk writer")?;
-
-    Ok(chunk_path)
-}
-
-/// Merges multiple sorted chunks into a single sorted file.
-///
-/// # Parameters
-///
-/// - `chunk_files`: A vector of `PathBuf` representing the paths to the sorted chunks to merge.
-/// - `output_path`: A reference to a `Path` specifying the path where the merged file will be written.
-/// - `headers`: A reference to a `StringRecord` containing the headers for the merged file.
-///
-/// # Returns
-///
-/// Returns a `Result`:
-fn merge_sorted_chunks(
-    chunk_files: Vec<PathBuf>,
-    output_path: &Path,
-    headers: &StringRecord,
-) -> Result<()> {
-    // If we only have one chunk, just rename it to the output
-    if chunk_files.len() == 1 {
-        std::fs::rename(&chunk_files[0], output_path)
-            .context("Failed to rename single chunk to output")?;
-        return Ok(());
-    }
-
-    // Limit the number of files open at once to prevent "Too many open files" error
-    const MAX_OPEN_FILES: usize = 100; // Conservative limit
-    let file_chunks = chunk_files.chunks(MAX_OPEN_FILES);
-    let mut temp_files = Vec::new();
-    let temp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
-
-    // Process files in batches
-    for (batch_num, batch) in file_chunks.enumerate() {
-        let mut chunks: BinaryHeap<SortedChunk> = BinaryHeap::with_capacity(batch.len());
-        
-        // Open files in this batch
-        for path in batch {
-            match SortedChunk::new(path.clone()) {
-                Ok(chunk) => chunks.push(chunk),
-                Err(e) => error!("Failed to create chunk reader for {:?}: {}", path, e),
-            }
-        }
-
-        // Create a temporary output file for this batch
-        let temp_output = temp_dir.path().join(format!("batch_{}.csv", batch_num));
-        let mut wtr = WriterBuilder::new()
-            .has_headers(batch_num == 0) // Only write headers for first batch
-            .from_path(&temp_output)
-            .context("Failed to create temporary output file")?;
-
-        if batch_num == 0 {
-            wtr.write_record(headers)
-                .context("Failed to write headers")?;
-        }
-
-        // Merge chunks in this batch
-        while let Some(mut chunk) = chunks.pop() {
-            match chunk.next_record() {
-                Ok(Some(record)) => {
-                    wtr.write_record(&record)
-                        .context("Failed to write record")?;
-                    chunks.push(chunk);
-                }
-                Ok(None) => continue, // No more records in this chunk
-                Err(e) => return Err(e).context("Failed to get next record from chunk"),
-            }
-        }
-
-        wtr.flush().context("Failed to flush writer")?;
-        temp_files.push(temp_output);
-    }
-
-    // If we only had one batch, just rename it to the final output
-    if temp_files.len() == 1 {
-        std::fs::rename(&temp_files[0], output_path)
-            .context("Failed to rename temporary file to output")?;
-    } else {
-        // Otherwise, merge the batch files
-        let mut chunks: BinaryHeap<SortedChunk> = BinaryHeap::with_capacity(MAX_OPEN_FILES);
-        
-        // Open all batch files
-        for path in &temp_files {
-            match SortedChunk::new(path.clone()) {
-                Ok(chunk) => chunks.push(chunk),
-                Err(e) => error!("Failed to create chunk reader for batch file: {}", e),
-            }
-        }
-
-        // Create final output file
-        let mut wtr = WriterBuilder::new()
-            .has_headers(true)
-            .from_path(output_path)
-            .context("Failed to create output file")?;
-
-        wtr.write_record(headers)
-            .context("Failed to write headers")?;
-
-        // Final merge of all batches
-        while let Some(mut chunk) = chunks.pop() {
-            match chunk.next_record() {
-                Ok(Some(record)) => {
-                    wtr.write_record(&record)
-                        .context("Failed to write record")?;
-                    chunks.push(chunk);
-                }
-                Ok(None) => continue, // No more records in this chunk
-                Err(e) => return Err(e).context("Failed to get next record from chunk"),
-            }
-        }
-
-        wtr.flush().context("Failed to flush output writer")?;
-    }
-
-    // Clean up temporary files
-    for file in temp_files {
-        if let Err(e) = std::fs::remove_file(&file) {
-            error!("Failed to remove temporary file {:?}: {}", file, e);
-        }
-    }
-
-    Ok(())
-}
-
-/// Sorts records based on specified columns using external sort for large datasets
-/// Sorts records based on specified columns using external sort for large datasets
-///
-/// # Arguments
-/// * `input_path` - Path to the input CSV file
-/// * `output_path` - Path where the sorted file will be written
-/// * `sort_columns` - List of column names to sort by (empty for no sorting)
-/// * `temp_dir` - Temporary directory for intermediate files
-///
-/// # Returns
-/// * `Result<()>` - Ok(()) on success, or an error
-fn external_sort(
-    input_path: &Path,
-    output_path: &Path,
-    sort_columns: &[&str],
-    temp_dir: &Path,
-) -> Result<()> {
-    if sort_columns.is_empty() {
-        // If no sort columns, just copy the file
-        std::fs::copy(input_path, output_path).context("Failed to copy file")?;
-        return Ok(());
-    }
-
-    // Read headers first
-    let file = File::open(input_path).context("Failed to open input file")?;
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(&file);
-    let headers = rdr.headers()?.clone();
-
-    // Get column indices for sorting
-    let column_indices: Vec<usize> = sort_columns
-        .iter()
-        .filter_map(|col| headers.iter().position(|h| h == *col))
-        .collect();
-
-    if column_indices.is_empty() {
-        return Err(anyhow::anyhow!(
-            "None of the specified sort columns were found in the CSV headers: {:?}",
-            sort_columns
-        ));
-    }
-
-    // Process in chunks
-    const CHUNK_SIZE: usize = 10_000; // Number of records per chunk
-    let mut chunk = Vec::with_capacity(CHUNK_SIZE);
-    let mut chunk_files = Vec::new();
-
-    // Read records in chunks, sort them, and write to temporary files
-    for result in rdr.records() {
-        let record = result.context("Failed to read record")?;
-        chunk.push(record);
-
-        if chunk.len() >= CHUNK_SIZE {
-            let chunk_path =
-                sort_and_write_chunk(chunk, &column_indices, temp_dir, chunk_files.len())?;
-            chunk_files.push(chunk_path);
-            chunk = Vec::with_capacity(CHUNK_SIZE);
-        }
-    }
-
-    // Process remaining records in the last chunk
-    if !chunk.is_empty() {
-        let chunk_path = sort_and_write_chunk(chunk, &column_indices, temp_dir, chunk_files.len())?;
-        chunk_files.push(chunk_path);
-    }
-
-    // Merge all sorted chunks into the final output
-    merge_sorted_chunks(chunk_files, output_path, &headers)
-}
-
-/// Processes a single input file by sorting it if needed
-/// Processes a single input file by sorting it if needed
-///
-/// # Arguments
-/// * `file_path` - Path to the input CSV file
-/// * `index` - Index of the file (used for temporary output file naming)
-/// * `sort_columns` - List of column names to sort by (empty for no sorting)
-/// * `temp_dir` - Temporary directory for intermediate files
-///
-/// # Returns
-/// * `Result<PathBuf>` - Path to the sorted file (or the original file if no sorting was needed)
-///
-fn process_input_file(
-    file_path: &str,
-    index: usize,
-    sort_columns: &[&str],
-    temp_dir: &Path,
-) -> Result<PathBuf> {
-    let temp_output = temp_dir.join(format!("sorted_{}.csv", index));
-    if sort_columns.is_empty() {
-        // No sorting needed, just copy the file
-        std::fs::copy(file_path, &temp_output).context("Failed to copy input file")?;
-    } else {
-        // Sort the file
-        external_sort(Path::new(file_path), &temp_output, sort_columns, temp_dir)
-            .context("Failed to sort input file")?;
-    }
-    Ok(temp_output)
-}
-
-/// Gets the indices of the columns to sort by
-fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec<usize> {
-    headers
-        .iter()
-        .enumerate()
-        .filter_map(|(i, h)| sort_columns.contains(&&*h.to_string()).then_some(i))
-        .collect()
-}
-
-/// Creates a CSV writer for the output file
-fn create_output_writer(output_file: &str, headers: &StringRecord) -> Result<Writer<File>> {
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(output_file)
-        .context("Failed to create output file")?;
-    wtr.write_record(headers)?;
-    Ok(wtr)
-}
-
-/// Writes all records to the output writer
-fn write_all_records<W: std::io::Write>(
-    wtr: &mut Writer<W>,
-    records: Vec<StringRecord>,
-) -> Result<()> {
-    for record in records {
-        wtr.write_record(&record)?;
-    }
-    wtr.flush()?;
-    Ok(())
-}
-
-/// Merges multiple sorted CSV files into a single output file with optional sorting
-/// # Arguments
-/// * `sorted_files` - A vector of sorted CSV file paths to merge
-/// * `output_file` - The path where the merged CSV will be written
-/// * `headers` - The headers from the first file (used for writing the merged output)
-/// * `sort_columns` - List of column names to sort by (empty for no sorting)
-///
-/// # Returns
-/// * `Result<()>` - Ok(()) on success, or an error
-fn merge_sorted_files(
-    sorted_files: &[PathBuf],
-    output_file: &str,
-    headers: &StringRecord,
-    sort_columns: &[&str],
-) -> Result<()> {
-    // If no files to merge, return early
-    if sorted_files.is_empty() {
-        return Ok(());
-    }
-
-    // Create output writer
-    let mut wtr = create_output_writer(output_file, headers)?;
-
-    if sort_columns.is_empty() {
-        // Simple case: no sorting needed, just concatenate files
-        for path in sorted_files {
-            let mut rdr = ReaderBuilder::new()
-                .has_headers(false) // Skip headers for all but the first file
-                .from_path(path)
-                .context("Failed to create CSV reader")?;
-
-            // Skip the header row for all files
-            let mut first = true;
-            for result in rdr.records() {
-                let record = result?;
-                if first {
-                    first = false;
-                    continue; // Skip header row
-                }
-                wtr.write_record(&record)?;
-            }
-        }
-    } else {
-        // Sort case: collect all records, sort them, then write
-        let mut all_records = Vec::new();
-
-        // Read all records from all files
-        for path in sorted_files {
-            let file_content = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read input file: {}", path.display()))?;
-            debug!("Reading file: {}", path.display());
-            debug!("File content:\n{}", file_content);
-
-            let mut rdr = ReaderBuilder::new()
-                .has_headers(false) // We'll handle headers manually
-                .from_path(&path)
-                .with_context(|| format!("Failed to create CSV reader for: {}", path.display()))?;
-
-            // Read all records (skip header if present)
-            let records: Vec<StringRecord> = rdr.records().collect::<Result<_, _>>()?;
-
-            // Skip the first record if it looks like a header (contains 'id,name')
-            let records_to_add = if !records.is_empty() && records[0].iter().any(|f| f == "id,name")
-            {
-                &records[1..]
-            } else {
-                &records[..]
-            };
-
-            debug!(
-                "Read {} records from {}",
-                records_to_add.len(),
-                path.display()
-            );
-            all_records.extend_from_slice(records_to_add);
-        }
-
-        if !all_records.is_empty() {
-            let header_indices = get_sort_column_indices(headers, sort_columns);
-
-            if !header_indices.is_empty() {
-                all_records.sort_by(|a, b| {
-                    for &i in &header_indices {
-                        let a_val = a.get(i).unwrap_or("");
-                        let b_val = b.get(i).unwrap_or("");
-                        let cmp = a_val.cmp(b_val);
-                        if cmp != std::cmp::Ordering::Equal {
-                            return cmp;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
-
-            write_all_records(&mut wtr, all_records)?;
-        }
-    }
-
-    Ok(())
 }
 
 /// Merges multiple CSV files into a single output file with optional sorting
-///
-/// # Arguments
-/// * `input_files` - A vector of input CSV file paths to merge
-/// * `output_file` - The path where the merged CSV will be written
-/// * `sort_columns` - List of column names to sort by (empty for no sorting)
-///
-/// # Returns
-/// * `Result<()>` - Ok(()) on success, or an error
-fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&str]) -> Result<()> {
-    info!("Merging CSV files into {}", output_file);
+fn merge_csv_files(
+    input_files: &[String],
+    output_file: &str,
+    sort_columns: &[&str],
+) -> Result<()> {
+    info!("Merging {} files into {}", input_files.len(), output_file);
     let start_time = Instant::now();
 
-    // Handle single file case without sorting
-    if input_files.len() == 1 && sort_columns.is_empty() {
-        std::fs::copy(&input_files[0], output_file).context("Failed to copy single input file")?;
-        info!("Copied single file to {}", output_file);
-        return Ok(());
-    }
+    // Convert input files to PathBuf
+    let input_paths: Vec<PathBuf> = input_files.iter().map(PathBuf::from).collect();
 
-    // Create a temporary directory for intermediate files
-    let temp_dir = create_temp_dir()?;
-    let temp_path = temp_dir.path();
-
-    // Process each input file
-    let mut sorted_files = Vec::with_capacity(input_files.len());
-    for (i, file_path) in input_files.iter().enumerate() {
-        info!(
-            "Processing file {}/{}: {}",
-            i + 1,
-            input_files.len(),
-            file_path
-        );
-        let sorted_file = process_input_file(file_path, i, sort_columns, temp_path)?;
-        sorted_files.push(sorted_file);
-    }
-
-    // Get headers from first file
-    let first_file = File::open(&input_files[0]).context("Failed to open first input file")?;
-    let headers = ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(first_file)
-        .headers()?
-        .clone();
-
-    // Handle single sorted file case
-    if sorted_files.len() == 1 {
-        std::fs::rename(&sorted_files[0], output_file).context("Failed to rename sorted file")?;
+    // If no sorting is needed, just concatenate the files
+    if sort_columns.is_empty() {
+        let first_file = File::open(&input_paths[0])
+            .context("Failed to open first input file")?;
+        let headers = ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(&first_file)
+            .headers()?
+            .clone();
+            
+        concatenate_files(&input_paths, output_file, &headers)?;
     } else {
-        // Merge the sorted files
-        merge_sorted_files(&sorted_files, output_file, &headers, sort_columns)?;
+        // Use parallel merge sort for large files with sorting
+        parallel_merge_sort(&input_paths, Path::new(output_file), sort_columns)
+            .context("Parallel merge sort failed")?;
     }
 
     let duration = start_time.elapsed();
@@ -655,61 +111,87 @@ fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&s
     Ok(())
 }
 
+/// Concatenates multiple CSV files without sorting
+fn concatenate_files(
+    files: &[PathBuf],
+    output_file: &str,
+    headers: &StringRecord,
+) -> Result<()> {
+    info!("Concatenating {} files", files.len());
+    
+    let output = File::create(output_file)
+        .context("Failed to create output file")?;
+    let mut writer = WriterBuilder::new()
+        .has_headers(true)
+        .from_writer(io::BufWriter::new(output));
+
+    // Write headers
+    writer.write_record(headers.iter())
+        .context("Failed to write headers")?;
+
+    // Concatenate all files
+    for (i, file) in files.iter().enumerate() {
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(i > 0) // Skip headers for all but the first file
+            .from_path(file)
+            .with_context(|| format!("Failed to open input file: {}", file.display()))?;
+
+        for result in rdr.records() {
+            let record = result.context("Failed to read record")?;
+            writer.write_record(&record)
+                .context("Failed to write record")?;
+        }
+    }
+
+    writer.flush().context("Failed to flush writer")?;
+    Ok(())
+}
+
 /// Splits a CSV file into multiple smaller files with optional sorting
-///
-/// # Arguments
-/// * `input_file` - Path to the input CSV file
-/// * `output_dir` - Directory where split files will be saved
-/// * `rows_per_file` - Maximum number of rows per output file
-/// * `sort_columns` - List of column names to sort by (empty for no sorting)
-///
-/// # Returns
-/// * `Result<()>` - Ok(()) on success, or an error
 fn split_csv_file(
     input_file: &str,
     output_dir: &str,
     rows_per_file: usize,
     sort_columns: &[&str],
 ) -> Result<()> {
-    info!("Splitting CSV file: {}", input_file);
-    let start_time = Instant::now();
-
+    info!("Splitting {} into chunks of {} rows", input_file, rows_per_file);
+    
     // Create output directory if it doesn't exist
     fs::create_dir_all(output_dir).context("Failed to create output directory")?;
-
+    
     // Create a temporary directory for sorting
-    let temp_dir = create_temp_dir()?;
-    let temp_path = temp_dir.path();
-
-    // Sort the input file if needed
-    let sorted_file = if sort_columns.is_empty() {
-        PathBuf::from(input_file)
-    } else {
-        let sorted_path = temp_path.join("sorted.csv");
-        external_sort(Path::new(input_file), &sorted_path, sort_columns, temp_path)
-            .context("Failed to sort input file")?;
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    
+    // If sorting is needed, sort the file first
+    let sorted_file = if !sort_columns.is_empty() {
+        let sorted_path = temp_dir.path().join("sorted.csv");
+        external_sort(Path::new(input_file), &sorted_path, sort_columns, temp_dir.path())?;
         sorted_path
+    } else {
+        PathBuf::from(input_file)
     };
-
-    // Open the (possibly sorted) input file
-    let file = File::open(&sorted_file).context("Failed to open sorted input file")?;
-    let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
-
+    
+    // Open the input file
+    let file = File::open(&sorted_file)
+        .context("Failed to open input file")?;
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(io::BufReader::new(file));
+    
     // Get headers
     let headers = rdr.headers()?.clone();
-
+    
     // Process the file in chunks
     let mut chunk_num = 0;
-    let mut records_written = 0;
     let mut current_chunk: Vec<StringRecord> = Vec::with_capacity(rows_per_file);
-
+    
     for result in rdr.records() {
         let record = result.context("Failed to read record")?;
         current_chunk.push(record);
-
+        
         if current_chunk.len() >= rows_per_file {
             write_chunk(
-                &output_dir,
+                output_dir,
                 &headers,
                 &current_chunk,
                 Path::new(input_file)
@@ -718,17 +200,16 @@ fn split_csv_file(
                     .unwrap_or("split"),
                 chunk_num,
             )?;
-
-            records_written += current_chunk.len();
+            
             chunk_num += 1;
             current_chunk.clear();
         }
     }
-
+    
     // Write the last chunk if it's not empty
     if !current_chunk.is_empty() {
         write_chunk(
-            &output_dir,
+            output_dir,
             &headers,
             &current_chunk,
             Path::new(input_file)
@@ -737,98 +218,95 @@ fn split_csv_file(
                 .unwrap_or("split"),
             chunk_num,
         )?;
-        records_written += current_chunk.len();
     }
-
-    let duration = start_time.elapsed();
-    info!(
-        "Successfully split {} records into {} files in {:.2?}",
-        records_written,
-        chunk_num + 1,
-        duration
-    );
-
+    
+    info!("Split into {} files in {}", chunk_num + 1, output_dir);
     Ok(())
 }
 
-/// Helper function to write a chunk of records to a file
+/// Writes a chunk of records to a file
 fn write_chunk(
     output_dir: &str,
     headers: &StringRecord,
     records: &[StringRecord],
-    file_stem: &str,
+    base_name: &str,
     chunk_num: usize,
 ) -> Result<()> {
-    let output_path = format!("{}/{}_part_{:04}.csv", output_dir, file_stem, chunk_num + 1);
-
+    let output_path = Path::new(output_dir).join(format!("{}_part_{:04}.csv", base_name, chunk_num));
+    
     let mut wtr = WriterBuilder::new()
         .has_headers(true)
         .from_path(&output_path)
         .context("Failed to create output file")?;
-
+    
     // Write headers
-    wtr.write_record(headers)?;
-
+    wtr.write_record(headers.iter())
+        .context("Failed to write headers")?;
+    
     // Write records
     for record in records {
         wtr.write_record(record)?;
     }
-
+    
     wtr.flush()?;
-    info!("Wrote {} records to {}", records.len(), output_path);
-
     Ok(())
 }
 
-fn main() -> Result<()> {
-    // Initialize logger
-    pretty_env_logger::init();
-    info!("Starting CSV split/merge tool");
-
-    // Parse command line arguments
-    let cli = Cli::parse();
-
-    // Execute the appropriate command
-    match cli.command {
-        Commands::Merge {
-            output,
-            sort_by,
-            input_files,
-        } => {
-            if input_files.is_empty() {
-                return Err(anyhow::anyhow!("No input files specified"));
-            }
-
-            let sort_columns: Vec<&str> = sort_by.split(',').filter(|s| !s.is_empty()).collect();
-            info!(
-                "Merging {} files sorted by {:?}",
-                input_files.len(),
-                sort_columns
-            );
-
-            merge_csv_files(&input_files, &output, &sort_columns)
-                .context("Failed to merge files")?;
-
-            info!("Successfully merged files into {}", output);
-        }
-        Commands::Split {
-            input,
-            output_dir,
-            rows,
-            sort_by,
-            workers: _,
-        } => {
-            let sort_columns: Vec<&str> = sort_by.split(',').filter(|s| !s.is_empty()).collect();
-
-            info!(
-                "Splitting '{}' into '{}' with {} rows per file, sorted by {:?}",
-                input, output_dir, rows, sort_columns
-            );
-
-            split_csv_file(&input, &output_dir, rows, &sort_columns)
-                .context("Failed to split file")?;
-        }
+/// Sorts a CSV file using external sort
+fn external_sort(
+    input_path: &Path,
+    output_path: &Path,
+    sort_columns: &[&str],
+    _temp_dir: &Path,
+) -> Result<()> {
+    info!("Sorting {:?} by {:?}", input_path, sort_columns);
+    
+    // Read headers
+    let file = File::open(input_path).context("Failed to open input file")?;
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(io::BufReader::new(file));
+    
+    let headers = rdr.headers()?.clone();
+    
+    // Get column indices for sorting
+    let column_indices: Vec<usize> = sort_columns
+        .iter()
+        .filter_map(|col| headers.iter().position(|h| h == *col))
+        .collect();
+    
+    if column_indices.is_empty() {
+        return Err(anyhow::anyhow!("No valid sort columns found"));
     }
-
+    
+    // Read all records
+    let mut records: Vec<StringRecord> = rdr.records().collect::<Result<_, _>>()?;
+    
+    // Sort records in parallel
+    records.par_sort_by(|a, b| {
+        for &idx in &column_indices {
+            let a_val = a.get(idx).unwrap_or("");
+            let b_val = b.get(idx).unwrap_or("");
+            let cmp = a_val.cmp(b_val);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    
+    // Write sorted records to output
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(output_path)
+        .context("Failed to create output file")?;
+    
+    wtr.write_record(headers.iter())?;
+    for record in records {
+        wtr.write_record(&record)?;
+    }
+    
+    wtr.flush()?;
+    
     Ok(())
 }
