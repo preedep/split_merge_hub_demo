@@ -302,21 +302,52 @@ fn merge_chunks(
         return Ok(());
     }
     
+    
     // Read headers from first chunk
-    let headers = {
+    let (headers, has_headers) = {
         let file = File::open(&chunk_files[0])
             .with_context(|| format!("Failed to open file: {:?}", &chunk_files[0]))?;
         let mut reader = ReaderBuilder::new()
-            .has_headers(true)
+            .has_headers(false)  // Always read first row as data
             .from_reader(BufReader::new(file));
-        reader.headers()?.clone()
+
+        // Read the first record to check if it looks like headers
+        let first_record = reader.records().next().transpose()?.unwrap_or_default();
+
+        // Check if first row looks like headers (all fields are strings, no numbers)
+        let looks_like_headers = first_record.iter().all(|field| {
+            field.chars().all(|c| c.is_alphabetic() || c == '_' || c == ' ')
+        });
+
+        if looks_like_headers {
+            (StringRecord::from(first_record.iter().collect::<Vec<_>>()), true)
+        } else {
+            // Create default headers (0, 1, 2, ...)
+            let default_headers: Vec<String> = (0..first_record.len())
+                .map(|i| i.to_string())
+                .collect();
+            (StringRecord::from(default_headers), false)
+        }
     };
-    
+
+    // If sort_columns is empty, use the first column as default
+    let sort_columns = if sort_columns.is_empty() {
+        info!("No sort columns specified, defaulting to first column");
+        vec!["0"]
+    } else {
+        sort_columns.to_vec()
+    };
+
     // Get sort column indices
-    let sort_indices: Vec<usize> = sort_columns
-        .iter()
-        .filter_map(|col| headers.iter().position(|h| h == *col))
-        .collect();
+    let sort_indices = if has_headers {
+        get_sort_column_indices(&headers, &sort_columns)
+    } else {
+        // If no headers, try to parse sort_columns as indices
+        sort_columns
+            .iter()
+            .filter_map(|col| col.parse::<usize>().ok())
+            .collect()
+    };
 
     // In the merge_chunks function, replace the sort_indices check with:
     if sort_indices.is_empty() {
