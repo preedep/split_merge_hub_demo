@@ -68,7 +68,7 @@ fn main() -> Result<()> {
             output,
             sort_by,
             chunk_size,
-        } => {
+        } => unsafe {
             // Set chunk size environment variable for the parallel merge
             std::env::set_var("CHUNK_SIZE_MB", chunk_size.to_string());
             let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
