@@ -127,7 +127,6 @@ pub fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &
         }
     }
 
-    // Get sort column indices
     let sort_indices = if has_headers {
         get_sort_column_indices(&headers, sort_columns)
     } else {
@@ -147,6 +146,15 @@ pub fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &
             Ok(file) => {
                 let mut reader = ReaderBuilder::new().has_headers(false).from_reader(BufReader::new(file));
                 let mut record = StringRecord::new();
+                // Always skip the first record if it is a header row and this chunk has headers
+                if has_headers {
+                    // Read and discard the first record (header)
+                    if !reader.read_record(&mut record)? {
+                        readers.push(None);
+                        continue;
+                    }
+                }
+                // Read the first data record
                 if reader.read_record(&mut record)? {
                     heap.push(MergeRecord { record, source_index: i });
                     readers.push(Some(reader));
