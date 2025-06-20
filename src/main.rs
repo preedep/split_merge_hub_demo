@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder, Writer};
-use log::{error, info};
+use log::{debug, error, info};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::{self, File};
@@ -17,7 +17,12 @@ struct SortedChunk {
     reader: Option<csv::Reader<File>>,
     current_record: Option<StringRecord>,
 }
-
+/// A sorted chunk of records for external sorting.
+///
+/// This is used to sort records in parallel and merge them in a sorted order.
+///
+/// The `reader` field contains the CSV reader for the chunk.
+/// The `current_record` field contains the next record in the chunk.
 impl SortedChunk {
     fn new(path: PathBuf) -> Result<Self> {
         let file = File::open(&path).context("Failed to open chunk file")?;
@@ -53,7 +58,7 @@ impl SortedChunk {
         }
     }
 }
-
+/// Implements traits required for sorting chunks in a min-heap
 impl Ord for SortedChunk {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap
@@ -243,6 +248,16 @@ fn merge_sorted_chunks(
 }
 
 /// Sorts records based on specified columns using external sort for large datasets
+/// Sorts records based on specified columns using external sort for large datasets
+///
+/// # Arguments
+/// * `input_path` - Path to the input CSV file
+/// * `output_path` - Path where the sorted file will be written
+/// * `sort_columns` - List of column names to sort by (empty for no sorting)
+/// * `temp_dir` - Temporary directory for intermediate files
+///
+/// # Returns
+/// * `Result<()>` - Ok(()) on success, or an error
 fn external_sort(
     input_path: &Path,
     output_path: &Path,
@@ -313,6 +328,17 @@ fn external_sort(
 
 
 /// Processes a single input file by sorting it if needed
+/// Processes a single input file by sorting it if needed
+///
+/// # Arguments
+/// * `file_path` - Path to the input CSV file
+/// * `index` - Index of the file (used for temporary output file naming)
+/// * `sort_columns` - List of column names to sort by (empty for no sorting)
+/// * `temp_dir` - Temporary directory for intermediate files
+///
+/// # Returns
+/// * `Result<PathBuf>` - Path to the sorted file (or the original file if no sorting was needed)
+/// 
 fn process_input_file(
     file_path: &str,
     index: usize,
@@ -370,6 +396,14 @@ fn write_all_records<W: std::io::Write>(
 }
 
 /// Merges multiple sorted CSV files into a single output file with optional sorting
+/// # Arguments
+/// * `sorted_files` - A vector of sorted CSV file paths to merge
+/// * `output_file` - The path where the merged CSV will be written
+/// * `headers` - The headers from the first file (used for writing the merged output)
+/// * `sort_columns` - List of column names to sort by (empty for no sorting)
+///
+/// # Returns
+/// * `Result<()>` - Ok(()) on success, or an error
 fn merge_sorted_files(
     sorted_files: &[PathBuf],
     output_file: &str,
@@ -411,8 +445,8 @@ fn merge_sorted_files(
         for path in sorted_files {
             let file_content = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read input file: {}", path.display()))?;
-            println!("Reading file: {}", path.display());
-            println!("File content:\n{}", file_content);
+            debug!("Reading file: {}", path.display());
+            debug!("File content:\n{}", file_content);
             
             let mut rdr = ReaderBuilder::new()
                 .has_headers(false) // We'll handle headers manually
@@ -429,7 +463,7 @@ fn merge_sorted_files(
                 &records[..]
             };
             
-            println!("Read {} records from {}", records_to_add.len(), path.display());
+            debug!("Read {} records from {}", records_to_add.len(), path.display());
             all_records.extend_from_slice(records_to_add);
         }
         
