@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
-use log::{error, info};
+use log::{error, info, warn};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -317,9 +317,14 @@ fn merge_chunks(
         .iter()
         .filter_map(|col| headers.iter().position(|h| h == *col))
         .collect();
-    
+
+    // In the merge_chunks function, replace the sort_indices check with:
     if sort_indices.is_empty() {
-        return Err(anyhow::anyhow!("No valid sort columns found in merge"));
+        let available_cols: Vec<&str> = headers.iter().collect();
+        return Err(anyhow::anyhow!(
+        "No valid sort columns found in merge. Requested: {:?}, Available: {:?}", 
+        sort_columns, available_cols
+    ));
     }
     
     // Open all chunk files
@@ -431,10 +436,37 @@ fn read_headers(file_path: &Path) -> Result<StringRecord> {
 
 /// Gets the indices of the columns to sort by
 fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec<usize> {
-    sort_columns
-        .iter()
-        .filter_map(|col| headers.iter().position(|h| h == *col))
-        .collect()
+    let mut indices = Vec::new();
+    let header_vec: Vec<&str> = headers.iter().collect();
+
+    info!("Available columns in CSV: {:?}", header_vec);
+    info!("Requested sort columns: {:?}", sort_columns);
+
+    for (i, col) in sort_columns.iter().enumerate() {
+        let col_trimmed = col.trim();
+        match headers.iter().position(|h| h.trim().eq_ignore_ascii_case(col_trimmed)) {
+            Some(idx) => {
+                info!("Sorting by column: '{}' (index {})", col_trimmed, idx);
+                indices.push(idx);
+            },
+            None => {
+                warn!("Warning: Sort column '{}' not found in headers", col_trimmed);
+                // Try to suggest similar column names
+                let similar: Vec<&str> = headers.iter()
+                    .filter(|h| h.trim().to_lowercase().contains(&col_trimmed.to_lowercase()))
+                    .collect();
+                if !similar.is_empty() {
+                    warn!("  Did you mean one of these? {:?}", similar);
+                }
+            }
+        }
+    }
+
+    if indices.is_empty() {
+        warn!("No valid sort columns found. Available columns: {:?}", header_vec);
+    }
+
+    indices
 }
 
 /// Compare two StringRecords based on the specified column indices
