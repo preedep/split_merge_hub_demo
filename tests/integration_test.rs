@@ -28,7 +28,7 @@ fn test_merge_csv_files() {
     
     // Verify the output - order doesn't matter for unsorted merge
     let output_content = fs::read_to_string(output).expect("Failed to read output file");
-    let mut lines: Vec<&str> = output_content.lines().collect();
+    let lines: Vec<&str> = output_content.lines().collect();
     
     // Check header
     assert_eq!(lines[0], "id,name", "Header mismatch");

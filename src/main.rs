@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use csv::{ReaderBuilder, StringRecord, WriterBuilder, Reader};
+use csv::{ReaderBuilder, StringRecord, WriterBuilder, Writer};
 use log::{error, info};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -337,77 +337,104 @@ fn process_input_file(
     Ok(temp_output)
 }
 
-/// Finds the smallest record among all available records
-fn find_smallest_record(records: &[Option<StringRecord>]) -> Option<(usize, &StringRecord)> {
-    let mut min_record: Option<(usize, &StringRecord)> = None;
-    
-    for (i, record_opt) in records.iter().enumerate() {
-        if let Some(record) = record_opt {
-            if let Some((_, min_rec)) = min_record {
-                // Compare with current min record
-                let rec_str: String = record.iter().collect();
-                let min_str: String = min_rec.iter().collect();
-                if rec_str < min_str {
-                    min_record = Some((i, record));
-                }
-            } else {
-                // First record found
-                min_record = Some((i, record));
-            }
-        }
-    }
-    
-    min_record
+/// Gets the indices of the columns to sort by
+fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec<usize> {
+    headers.iter()
+        .enumerate()
+        .filter_map(|(i, h)| {
+            sort_columns.contains(&&*h.to_string()).then_some(i)
+        })
+        .collect()
 }
 
-/// Merges multiple sorted CSV files into a single output file
+/// Creates a CSV writer for the output file
+fn create_output_writer(output_file: &str, headers: &StringRecord) -> Result<Writer<File>> {
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(output_file)
+        .context("Failed to create output file")?;
+    wtr.write_record(headers)?;
+    Ok(wtr)
+}
+
+/// Writes all records to the output writer
+fn write_all_records<W: std::io::Write>(
+    wtr: &mut Writer<W>,
+    records: Vec<StringRecord>,
+) -> Result<()> {
+    for record in records {
+        wtr.write_record(&record)?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
+/// Merges multiple sorted CSV files into a single output file with optional sorting
 fn merge_sorted_files(
     sorted_files: &[PathBuf],
     output_file: &str,
     headers: &StringRecord,
     sort_columns: &[&str],
 ) -> Result<()> {
-    let mut readers: Vec<Reader<File>> = Vec::with_capacity(sorted_files.len());
-    
-    // Open all files
-    for path in sorted_files {
-        let file = File::open(path).context("Failed to open sorted chunk")?;
-        let rdr = ReaderBuilder::new()
-            .has_headers(true)
-            .from_reader(file);
-        readers.push(rdr);
+    // If no files to merge, return early
+    if sorted_files.is_empty() {
+        return Ok(());
     }
     
     // Create output writer
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(output_file)
-        .context("Failed to create output file")?;
+    let mut wtr = create_output_writer(output_file, headers)?;
     
-    // Write headers
-    wtr.write_record(headers)?;
-    
-    // If we have sort columns, we need to sort all records
-    if !sort_columns.is_empty() {
-        // Collect all records
-        let mut all_records = Vec::new();
-        for reader in &mut readers {
-            for result in reader.records() {
-                all_records.push(result?);
+    if sort_columns.is_empty() {
+        // Simple case: no sorting needed, just concatenate files
+        for path in sorted_files {
+            let mut rdr = ReaderBuilder::new()
+                .has_headers(false) // Skip headers for all but the first file
+                .from_path(path)
+                .context("Failed to create CSV reader")?;
+                
+            // Skip the header row for all files
+            let mut first = true;
+            for result in rdr.records() {
+                let record = result?;
+                if first {
+                    first = false;
+                    continue; // Skip header row
+                }
+                wtr.write_record(&record)?;
             }
         }
+    } else {
+        // Sort case: collect all records, sort them, then write
+        let mut all_records = Vec::new();
         
-        // Sort the records
+        // Read all records from all files
+        for path in sorted_files {
+            let file_content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read input file: {}", path.display()))?;
+            println!("Reading file: {}", path.display());
+            println!("File content:\n{}", file_content);
+            
+            let mut rdr = ReaderBuilder::new()
+                .has_headers(false) // We'll handle headers manually
+                .from_path(&path)
+                .with_context(|| format!("Failed to create CSV reader for: {}", path.display()))?;
+            
+            // Read all records (skip header if present)
+            let records: Vec<StringRecord> = rdr.records().collect::<Result<_, _>>()?;
+            
+            // Skip the first record if it looks like a header (contains 'id,name')
+            let records_to_add = if !records.is_empty() && records[0].iter().any(|f| f == "id,name") {
+                &records[1..]
+            } else {
+                &records[..]
+            };
+            
+            println!("Read {} records from {}", records_to_add.len(), path.display());
+            all_records.extend_from_slice(records_to_add);
+        }
+        
         if !all_records.is_empty() {
-            // Get the header indices for the sort columns
-            let header_indices: Vec<usize> = headers.iter()
-                .enumerate()
-                .filter(|(_, h)| {
-                    let header_str = h.to_string();
-                    sort_columns.contains(&&*header_str)
-                })
-                .map(|(i, _)| i)
-                .collect();
+            let header_indices = get_sort_column_indices(headers, sort_columns);
             
             if !header_indices.is_empty() {
                 all_records.sort_by(|a, b| {
@@ -423,23 +450,10 @@ fn merge_sorted_files(
                 });
             }
             
-            // Write the sorted records
-            for record in all_records {
-                wtr.write_record(&record)?;
-            }
-        }
-    } else {
-        // No sorting needed, just write all records
-        for reader in &mut readers {
-            for result in reader.records() {
-                let record = result?;
-                wtr.write_record(&record)?;
-            }
+            write_all_records(&mut wtr, all_records)?;
         }
     }
     
-    // Flush the writer to ensure all data is written
-    wtr.flush()?;
     Ok(())
 }
 

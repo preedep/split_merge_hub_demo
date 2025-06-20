@@ -28,3 +28,6 @@ target/
 /split_output/*
 /test_data/*
 
+/test_sort1.csv
+/test_sort2.csv
+/test_sorted_output.csv
