@@ -244,74 +244,17 @@ fn sort_and_write_chunk(
     Ok(chunk_path)
 }
 
-/// Merges multiple sorted chunk files into a single sorted output file.
+/// Merges multiple sorted chunks into a single sorted file.
 ///
-/// This function takes in a vector of paths to sorted chunk files, reads their records,
-/// and merges them into a single sorted CSV file in the specified output path using
-/// a min-heap for efficient merging. If only one chunk file is provided, the function
-/// renames it directly to the output path. Each chunk file is expected to be pre-sorted,
-/// and the final output will also maintain sorted order. The provided `headers` are
-/// written to the output as the first row.
+/// # Parameters
 ///
-/// # Arguments
-///
-/// * `chunk_files` - A vector of file paths pointing to the sorted chunk files to be merged.
-/// * `output_path` - The path to the final output file where the merged data will be saved.
-/// * `headers` - A `StringRecord` containing the header row to be written to the output file.
+/// - `chunk_files`: A vector of `PathBuf` representing the paths to the sorted chunks to merge.
+/// - `output_path`: A reference to a `Path` specifying the path where the merged file will be written.
+/// - `headers`: A reference to a `StringRecord` containing the headers for the merged file.
 ///
 /// # Returns
 ///
-/// A `Result` which is:
-/// - `Ok(())` if the merge process is successful.
-/// - `Err` if an error occurs during file operations, reading records, writing records, or
-///   any other process.
-///
-/// # Errors
-///
-/// This function will return an error if:
-/// - Renaming the single chunk file fails (if `chunk_files` has only one entry).
-/// - Creating the output file fails.
-/// - Writing the CSV headers fails.
-/// - Reading records from any of the chunk files fails.
-/// - Writing records to the output file or flushing the writer fails.
-/// - Any `SortedChunk` initialization fails.
-///
-/// # Implementation Notes
-///
-/// - The function utilizes a `BinaryHeap` as a min-heap to efficiently pick the smallest record
-///   across all open chunk files during the merging process.
-/// - Empty or improperly formatted chunk files will not participate in the merging process,
-///   but any errors during file handling or processing will terminate the function early.
-/// - Iterating through each chunk stops when all records from all chunks are consumed.
-///
-/// # Example
-///
-/// ```rust
-/// use std::path::PathBuf;
-/// use csv::StringRecord;
-///
-/// let chunk_files = vec![
-///     PathBuf::from("chunk_1.csv"),
-///     PathBuf::from("chunk_2.csv"),
-///     PathBuf::from("chunk_3.csv"),
-/// ];
-/// let output_path = PathBuf::from("sorted_output.csv");
-/// let headers = StringRecord::from(vec!["column1", "column2"]);
-///
-/// if let Err(err) = merge_sorted_chunks(chunk_files, &output_path, &headers) {
-///     eprintln!("Error occurred during merging: {}", err);
-/// }
-/// ```
-///
-/// In this example, three sorted chunk files (`chunk_1.csv`, `chunk_2.csv`, and `chunk_3.csv`)
-/// are merged into a single sorted output file named `sorted_output.csv` with the specified
-/// headers written as the first row.
-///
-/// # Dependencies
-///
-/// This function assumes that `SortedChunk` is a module or class capable of:
-/// - Reading and iterating through a CSV file in sorted order.
-/// - Providing the next record (`next_record`) from the sorted chunk.
+/// Returns a `Result`:
 fn merge_sorted_chunks(
     chunk_files: Vec<PathBuf>,
     output_path: &Path,
@@ -324,44 +267,101 @@ fn merge_sorted_chunks(
         return Ok(());
     }
 
-    // Merge sorted chunks using a min-heap
-    let mut chunks: BinaryHeap<SortedChunk> = BinaryHeap::new();
-    for path in chunk_files {
-        match SortedChunk::new(path) {
-            Ok(chunk) => chunks.push(chunk),
-            Err(e) => error!("Failed to create chunk reader: {}", e),
+    // Limit the number of files open at once to prevent "Too many open files" error
+    const MAX_OPEN_FILES: usize = 100; // Conservative limit
+    let mut file_chunks = chunk_files.chunks(MAX_OPEN_FILES);
+    let mut temp_files = Vec::new();
+    let temp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
+
+    // Process files in batches
+    for (batch_num, batch) in file_chunks.enumerate() {
+        let mut chunks: BinaryHeap<SortedChunk> = BinaryHeap::with_capacity(batch.len());
+        
+        // Open files in this batch
+        for path in batch {
+            match SortedChunk::new(path.clone()) {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => error!("Failed to create chunk reader for {:?}: {}", path, e),
+            }
+        }
+
+        // Create a temporary output file for this batch
+        let temp_output = temp_dir.path().join(format!("batch_{}.csv", batch_num));
+        let mut wtr = WriterBuilder::new()
+            .has_headers(batch_num == 0) // Only write headers for first batch
+            .from_path(&temp_output)
+            .context("Failed to create temporary output file")?;
+
+        if batch_num == 0 {
+            wtr.write_record(headers)
+                .context("Failed to write headers")?;
+        }
+
+        // Merge chunks in this batch
+        while let Some(mut chunk) = chunks.pop() {
+            match chunk.next_record() {
+                Ok(Some(record)) => {
+                    wtr.write_record(&record)
+                        .context("Failed to write record")?;
+                    chunks.push(chunk);
+                }
+                Ok(None) => continue, // No more records in this chunk
+                Err(e) => return Err(e).context("Failed to get next record from chunk"),
+            }
+        }
+
+        wtr.flush().context("Failed to flush writer")?;
+        temp_files.push(temp_output);
+    }
+
+    // If we only had one batch, just rename it to the final output
+    if temp_files.len() == 1 {
+        std::fs::rename(&temp_files[0], output_path)
+            .context("Failed to rename temporary file to output")?;
+    } else {
+        // Otherwise, merge the batch files
+        let mut chunks: BinaryHeap<SortedChunk> = BinaryHeap::with_capacity(MAX_OPEN_FILES);
+        
+        // Open all batch files
+        for path in &temp_files {
+            match SortedChunk::new(path.clone()) {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => error!("Failed to create chunk reader for batch file: {}", e),
+            }
+        }
+
+        // Create final output file
+        let mut wtr = WriterBuilder::new()
+            .has_headers(true)
+            .from_path(output_path)
+            .context("Failed to create output file")?;
+
+        wtr.write_record(headers)
+            .context("Failed to write headers")?;
+
+        // Final merge of all batches
+        while let Some(mut chunk) = chunks.pop() {
+            match chunk.next_record() {
+                Ok(Some(record)) => {
+                    wtr.write_record(&record)
+                        .context("Failed to write record")?;
+                    chunks.push(chunk);
+                }
+                Ok(None) => continue, // No more records in this chunk
+                Err(e) => return Err(e).context("Failed to get next record from chunk"),
+            }
+        }
+
+        wtr.flush().context("Failed to flush output writer")?;
+    }
+
+    // Clean up temporary files
+    for file in temp_files {
+        if let Err(e) = std::fs::remove_file(&file) {
+            error!("Failed to remove temporary file {:?}: {}", file, e);
         }
     }
 
-    // Write merged and sorted output
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(output_path)
-        .context("Failed to create output file")?;
-
-    // Write headers
-    wtr.write_record(headers)
-        .context("Failed to write headers")?;
-
-    // Merge chunks using a min-heap
-    while let Some(mut chunk) = chunks.pop() {
-        match chunk.next_record() {
-            Ok(Some(record)) => {
-                wtr.write_record(&record)
-                    .context("Failed to write record")?;
-                chunks.push(chunk);
-            }
-            Ok(None) => {
-                // No more records in this chunk, drop it
-                continue;
-            }
-            Err(e) => {
-                return Err(e).context("Failed to get next record from chunk");
-            }
-        }
-    }
-
-    wtr.flush().context("Failed to flush output writer")?;
     Ok(())
 }
 
