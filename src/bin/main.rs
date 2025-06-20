@@ -269,7 +269,7 @@ fn merge_sorted_chunks(
 
     // Limit the number of files open at once to prevent "Too many open files" error
     const MAX_OPEN_FILES: usize = 100; // Conservative limit
-    let mut file_chunks = chunk_files.chunks(MAX_OPEN_FILES);
+    let file_chunks = chunk_files.chunks(MAX_OPEN_FILES);
     let mut temp_files = Vec::new();
     let temp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
 
