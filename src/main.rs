@@ -169,7 +169,64 @@ fn compare_records(
     Ordering::Equal
 }
 
-/// Sorts a chunk of records and writes it to a temporary file
+/// Sorts a chunk of CSV records based on specified column indices and writes the sorted chunk to a temporary file.
+///
+/// # Parameters
+///
+/// - `chunk`: A vector of `StringRecord` representing a chunk of CSV records to sort and write.
+/// - `column_indices`: A slice of column indices (`&[usize]`) that determines the sort order. Records are sorted
+///   by the values in these columns, in the order they appear in the slice.
+/// - `temp_dir`: A reference to a `Path` specifying the directory where the temporary file for the sorted chunk 
+///   will be written.
+/// - `chunk_num`: An integer (`usize`) representing the index or number of the chunk. This is used to name
+///   the corresponding temporary file uniquely.
+///
+/// # Returns
+///
+/// Returns a `Result<PathBuf>`:
+/// - On success, returns the path to the temporary file where the sorted chunk is written.
+/// - On error, returns an error wrapped in a `Result` (e.g., if sorting or file I/O operations fail).
+///
+/// # Errors
+///
+/// - Returns an error if the temporary file cannot be created (e.g., due to permission issues or invalid path).
+/// - Returns an error if writing a record to the file fails.
+/// - Returns an error if flushing the writer buffer fails.
+///
+/// # Notes
+///
+/// - This function assumes that the input vector `chunk` contains `StringRecord` objects with enough columns
+///   for the provided `column_indices` to be valid.
+/// - The temporary file is created in the specified `temp_dir` and is named in the format "chunk_{chunk_num}.csv".
+/// - No headers are added to the temporary file as the writer is configured to exclude headers.
+///
+/// # Example
+///
+/// ```rust
+/// use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+/// use std::fs::File;
+/// use std::path::Path;
+/// use tempfile::tempdir;
+///
+/// let temp_dir = tempdir().unwrap();
+/// let chunk = vec![
+///     StringRecord::from(vec!["2", "b"]),
+///     StringRecord::from(vec!["1", "a"])
+/// ];
+/// let column_indices = &[0]; // Sort by the first column.
+///
+/// let chunk_path = sort_and_write_chunk(chunk, column_indices, temp_dir.path(), 1).unwrap();
+/// assert!(chunk_path.exists());
+/// ```
+///
+/// # Dependencies
+///
+/// - `csv`: For working with CSV records and files.
+/// - `anyhow`: For error handling with context messages.
+///
+/// # See Also
+///
+/// - `compare_records`: Utility function used to compare records based on column indices.
 fn sort_and_write_chunk(
     mut chunk: Vec<StringRecord>,
     column_indices: &[usize],
@@ -195,7 +252,74 @@ fn sort_and_write_chunk(
     Ok(chunk_path)
 }
 
-/// Merges sorted chunks into the final output file
+/// Merges multiple sorted chunk files into a single sorted output file.
+///
+/// This function takes in a vector of paths to sorted chunk files, reads their records,
+/// and merges them into a single sorted CSV file in the specified output path using
+/// a min-heap for efficient merging. If only one chunk file is provided, the function
+/// renames it directly to the output path. Each chunk file is expected to be pre-sorted,
+/// and the final output will also maintain sorted order. The provided `headers` are
+/// written to the output as the first row.
+///
+/// # Arguments
+///
+/// * `chunk_files` - A vector of file paths pointing to the sorted chunk files to be merged.
+/// * `output_path` - The path to the final output file where the merged data will be saved.
+/// * `headers` - A `StringRecord` containing the header row to be written to the output file.
+///
+/// # Returns
+///
+/// A `Result` which is:
+/// - `Ok(())` if the merge process is successful.
+/// - `Err` if an error occurs during file operations, reading records, writing records, or
+///   any other process.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - Renaming the single chunk file fails (if `chunk_files` has only one entry).
+/// - Creating the output file fails.
+/// - Writing the CSV headers fails.
+/// - Reading records from any of the chunk files fails.
+/// - Writing records to the output file or flushing the writer fails.
+/// - Any `SortedChunk` initialization fails.
+///
+/// # Implementation Notes
+///
+/// - The function utilizes a `BinaryHeap` as a min-heap to efficiently pick the smallest record
+///   across all open chunk files during the merging process.
+/// - Empty or improperly formatted chunk files will not participate in the merging process,
+///   but any errors during file handling or processing will terminate the function early.
+/// - Iterating through each chunk stops when all records from all chunks are consumed.
+///
+/// # Example
+///
+/// ```rust
+/// use std::path::PathBuf;
+/// use csv::StringRecord;
+///
+/// let chunk_files = vec![
+///     PathBuf::from("chunk_1.csv"),
+///     PathBuf::from("chunk_2.csv"),
+///     PathBuf::from("chunk_3.csv"),
+/// ];
+/// let output_path = PathBuf::from("sorted_output.csv");
+/// let headers = StringRecord::from(vec!["column1", "column2"]);
+///
+/// if let Err(err) = merge_sorted_chunks(chunk_files, &output_path, &headers) {
+///     eprintln!("Error occurred during merging: {}", err);
+/// }
+/// ```
+///
+/// In this example, three sorted chunk files (`chunk_1.csv`, `chunk_2.csv`, and `chunk_3.csv`)
+/// are merged into a single sorted output file named `sorted_output.csv` with the specified
+/// headers written as the first row.
+///
+/// # Dependencies
+///
+/// This function assumes that `SortedChunk` is a module or class capable of:
+/// - Reading and iterating through a CSV file in sorted order.
+/// - Providing the next record (`next_record`) from the sorted chunk.
 fn merge_sorted_chunks(
     chunk_files: Vec<PathBuf>,
     output_path: &Path,
