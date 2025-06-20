@@ -1,66 +1,73 @@
 #!/bin/bash
 set -e
 
+# Configuration
+INPUT_DIR="large_files"
+OUTPUT_DIR="merge_files"
+OUTPUT_FILE="${OUTPUT_DIR}/merged_accounts.csv"
+SORT_BY="account_no"
+INPUT_FILES=("${INPUT_DIR}/accounts_1.csv" "${INPUT_DIR}/accounts_2.csv")
+
 # Set log level
-export RUST_LOG=debug
+export RUST_LOG=info
 
-# Build the project
-echo "Building the project..."
-cargo build --release
+# Create output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
 
-# Create test directories
-TEST_DIR="./test_data"
-MERGED_DIR="$TEST_DIR/merged"
-SPLIT_DIR="$TEST_DIR/split"
-mkdir -p "$TEST_DIR" "$MERGED_DIR" "$SPLIT_DIR"
+echo "=== Starting CSV Merge Process ==="
 
-# Function to print time
-print_time() {
-    local duration=$1
-    local operation=$2
-    echo -e "\\n=== $operation completed in $(printf '%.2f' $duration)s ===\\n"
-}
+# Check if input files exist
+for file in "${INPUT_FILES[@]}"; do
+    if [ ! -f "$file" ]; then
+        echo "❌ Error: Input file not found: $file"
+        exit 1
+    fi
+    echo "✅ Found input file: $file"
+done
 
-# Function to generate test CSV files
-generate_test_csv() {
-    local filename=$1
-    local rows=$2
-    echo "name,age,city" > "$filename"
+# Build the project if not already built
+if [ ! -f "./target/release/split_merge_hub_demo" ]; then
+    echo "\n🔨 Building the project (this may take a minute)..."
+    cargo build --release --bin split_merge_hub_demo
+fi
 
-    for i in $(seq 1 "$rows"); do
-        echo "User$i,$((20 + RANDOM % 50)),City$((RANDOM % 5))" >> "$filename"
-    done
-    echo "Generated test file: $filename"
-}
+echo "\n🔄 Starting merge process..."
+echo "   Input files: ${INPUT_FILES[*]}"
+echo "   Output file: ${OUTPUT_FILE}"
+echo "   Sort by: ${SORT_BY}"
 
-# Generate test files
-echo -e "\n=== Generating test files ==="
-generate_test_csv "$TEST_DIR/file1.csv" 10000
-generate_test_csv "$TEST_DIR/file2.csv" 15000
+# Record start time
+START_TIME=$(date +%s)
 
-# Test 1: Merge two CSV files
-echo -e "\n=== Testing CSV Merge ==="
-start_time=$(date +%s.%N)
-./target/release/split_merge_hub_demo merge "$MERGED_DIR/merged.csv" -s "name,age" "$TEST_DIR/file1.csv" "$TEST_DIR/file2.csv"
-end_time=$(date +%s.%N)
-print_time $(echo "$end_time - $start_time" | bc) "Merge"
+# Run the merge command
+set +e
+./target/release/split_merge_hub_demo merge \
+    "$OUTPUT_FILE" \
+    --sort-by "$SORT_BY" \
+    "${INPUT_FILES[@]}"
 
-# Test 2: Split a CSV file
-echo -e "\n=== Testing CSV Split ==="
-start_time=$(date +%s.%N)
-./target/release/split_merge_hub_demo split "$MERGED_DIR/merged.csv" "$SPLIT_DIR" -r 1000 -s "age,name"
-end_time=$(date +%s.%N)
-print_time $(echo "$end_time - $start_time" | bc) "Split"
+# Check if merge was successful
+if [ $? -ne 0 ]; then
+    echo "\n❌ Error: Merge failed"
+    exit 1
+fi
+set -e
 
-# Test 3: Parallel processing
-echo -e "\n=== Testing Parallel Processing ==="
-start_time=$(date +%s.%N)
-./target/release/split_merge_hub_demo merge "$MERGED_DIR/parallel_merged.csv" -s "name" "$TEST_DIR/file1.csv" "$TEST_DIR/file2.csv" --workers 4
-end_time=$(date +%s.%N)
-print_time $(echo "$end_time - $start_time" | bc) "Parallel Merge"
+# Calculate and display duration
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
 
-echo -e "\n=== Test Summary ==="
-echo "1. Merged files: $MERGED_DIR/merged.csv"
-echo "2. Split files: $SPLIT_DIR/"
-echo "3. Parallel merge: $MERGED_DIR/parallel_merged.csv"
-echo -e "\nAll tests completed successfully!"
+# Get file size in human-readable format
+if command -v du &> /dev/null; then
+    FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
+else
+    # Fallback if du is not available
+    FILE_SIZE="unknown size"
+fi
+
+echo "\n✅ Merge completed successfully!"
+echo "   Output file: ${OUTPUT_FILE}"
+echo "   File size: ${FILE_SIZE}"
+echo "   Time taken: ${DURATION} seconds"
+echo "\n=== Process completed ===\n"
+
