@@ -28,6 +28,7 @@ target/
 /split_output/*
 /test_data/*
 /demo_*/*
+/large_files/*
 
 /test_sort1.csv
 /test_sort2.csv
