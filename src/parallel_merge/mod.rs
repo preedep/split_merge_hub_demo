@@ -8,8 +8,8 @@ use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 // Type alias for CSV reader with BufReader
@@ -36,7 +36,10 @@ struct MergeRecord {
 impl MergeRecord {
     /// Creates a new MergeRecord with the given record and source index
     fn new(record: StringRecord, source_index: usize) -> Self {
-        Self { record, source_index }
+        Self {
+            record,
+            source_index,
+        }
     }
 }
 
@@ -76,28 +79,31 @@ pub fn parallel_merge_sort(
     if input_paths.is_empty() {
         return Err(anyhow::anyhow!("No input files provided"));
     }
-    info!("Starting parallel merge sort for {} files", input_paths.len());
-    
+    info!(
+        "Starting parallel merge sort for {} files",
+        input_paths.len()
+    );
+
     if input_paths.is_empty() {
         return Err(anyhow::anyhow!("No input files provided"));
     }
 
     // Create a temporary directory for chunk files
-    let temp_dir = TempDir::new()
-        .context("Failed to create temporary directory")?;
+    let temp_dir = TempDir::new().context("Failed to create temporary directory")?;
     info!("Using temporary directory: {:?}", temp_dir.path());
-    
+
     let chunk_files: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
     let chunk_size = get_chunk_size();
-    
-    info!("Processing {} input files with chunk size: {} MB", 
-        input_paths.len(), 
+
+    info!(
+        "Processing {} input files with chunk size: {} MB",
+        input_paths.len(),
         chunk_size / 1_000_000
     );
 
     // Create a chunk counter for tracking progress
     let chunk_counter = Arc::new(AtomicUsize::new(0));
-    
+
     // Process each input file in parallel
     let mut all_chunks = Vec::new();
     for input_path in input_paths {
@@ -106,7 +112,7 @@ pub fn parallel_merge_sort(
         let chunks = process_file(&path, &temp_dir, sort_columns, chunk_counter.as_ref())?;
         all_chunks.extend(chunks);
     }
-    
+
     info!("Processed all files. Created {} chunks", all_chunks.len());
 
     // If we only have one chunk, just rename it to the output file
@@ -118,14 +124,14 @@ pub fn parallel_merge_sort(
     }
 
     info!("Merging {} chunks into final output", all_chunks.len());
-    
+
     // Merge all chunks
     let result = merge_chunks(&all_chunks, output_path.as_ref(), sort_columns);
-    
+
     if result.is_ok() {
         info!("Successfully wrote output to {:?}", output_path.as_ref());
     }
-    
+
     result
 }
 
@@ -136,7 +142,7 @@ fn process_chunks_in_parallel(
     sort_columns: &[&str],
 ) -> Result<Vec<PathBuf>> {
     let chunk_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    
+
     // Process each input file in parallel
     let chunk_files: Vec<PathBuf> = input_files
         .par_iter()
@@ -150,7 +156,7 @@ fn process_chunks_in_parallel(
             }
         })
         .collect();
-    
+
     Ok(chunk_files)
 }
 /// Processes a single input file into sorted chunks
@@ -161,7 +167,7 @@ fn process_file(
     chunk_counter: &std::sync::atomic::AtomicUsize,
 ) -> Result<Vec<PathBuf>> {
     info!("Processing file: {:?}", file_path);
-    
+
     // Read headers first to get column indices
     let headers = {
         let file = std::fs::File::open(file_path)
@@ -171,23 +177,23 @@ fn process_file(
             .from_reader(BufReader::new(file));
         rdr.headers()?.clone()
     };
-    
+
     // Get sort column indices
     let sort_indices: Vec<usize> = sort_columns
         .iter()
         .filter_map(|col| headers.iter().position(|h| h == *col))
         .collect();
-    
+
     if sort_indices.is_empty() {
         anyhow::bail!("None of the specified sort columns were found in the file");
     }
-    
+
     // Process the file in chunks
     let file = std::fs::File::open(file_path)
         .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
     let file_size = file.metadata()?.len() as usize;
     info!("File size: {} MB", file_size / 1_000_000);
-    
+
     // Process the file chunks
     process_file_chunks(file_path, temp_dir, &headers, &sort_indices, chunk_counter)
 }
@@ -202,55 +208,49 @@ fn process_file_chunks(
 ) -> Result<Vec<PathBuf>> {
     let file = std::fs::File::open(file_path)
         .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-    
+
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .from_reader(std::io::BufReader::new(file));
-    
+
     let mut records = Vec::new();
     let mut current_size = 0;
     let chunk_size = get_chunk_size();
     let mut local_chunks = Vec::new();
     let mut record_count = 0;
-    
+
     // Read records in chunks based on size
     for result in rdr.records() {
         let record = result?;
         let record_size = record.as_slice().len();
         record_count += 1;
-        
+
         // If adding this record would exceed our chunk size, process the current chunk
         if !records.is_empty() && (current_size + record_size) > chunk_size {
-            let chunk_path = sort_and_write_chunk(
-                &mut records,
-                temp_dir,
-                headers,
-                sort_indices,
-                chunk_counter,
-            )?;
+            let chunk_path =
+                sort_and_write_chunk(&mut records, temp_dir, headers, sort_indices, chunk_counter)?;
             local_chunks.push(chunk_path);
             current_size = 0;
             records = Vec::new();
         }
-        
+
         records.push(record);
         current_size += record_size;
     }
-    
+
     // Process any remaining records in the last chunk
     if !records.is_empty() {
-        let chunk_path = sort_and_write_chunk(
-            &mut records,
-            temp_dir,
-            headers,
-            sort_indices,
-            chunk_counter,
-        )?;
+        let chunk_path =
+            sort_and_write_chunk(&mut records, temp_dir, headers, sort_indices, chunk_counter)?;
         local_chunks.push(chunk_path);
     }
-    
-    info!("Processed {} records into {} chunks", record_count, local_chunks.len());
-    
+
+    info!(
+        "Processed {} records into {} chunks",
+        record_count,
+        local_chunks.len()
+    );
+
     Ok(local_chunks)
 }
 
@@ -264,51 +264,50 @@ fn sort_and_write_chunk(
 ) -> Result<PathBuf> {
     // Sort the chunk using the specified columns
     records.par_sort_by(|a, b| compare_records(a, b, sort_indices));
-    
+
     // Create a temporary file for this chunk
     let chunk_num = chunk_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let chunk_path = temp_dir.path().join(format!("chunk_{}.csv", chunk_num));
-    
+
     // Write the sorted chunk to a file
     let mut writer = WriterBuilder::new()
         .has_headers(false)
         .from_path(&chunk_path)?;
-    
+
     for record in records.drain(..) {
         writer.write_record(&record)?;
     }
-    
+
     writer.flush()?;
     records.clear();
-    
+
     Ok(chunk_path)
 }
 
 /// Merges multiple sorted chunks into a single output file
-fn merge_chunks(
-    chunk_files: &[PathBuf],
-    output_path: &Path,
-    sort_columns: &[&str],
-) -> Result<()> {
+fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &[&str]) -> Result<()> {
     if chunk_files.is_empty() {
         return Ok(());
     }
-    
-    info!("Merging {} chunks into {:?}", chunk_files.len(), output_path);
-    
+
+    info!(
+        "Merging {} chunks into {:?}",
+        chunk_files.len(),
+        output_path
+    );
+
     // If there's only one chunk, just rename it
     if chunk_files.len() == 1 {
         std::fs::rename(&chunk_files[0], output_path)?;
         return Ok(());
     }
-    
-    
+
     // Read headers from first chunk
     let (headers, has_headers) = {
         let file = File::open(&chunk_files[0])
             .with_context(|| format!("Failed to open file: {:?}", &chunk_files[0]))?;
         let mut reader = ReaderBuilder::new()
-            .has_headers(false)  // Always read first row as data
+            .has_headers(false) // Always read first row as data
             .from_reader(BufReader::new(file));
 
         // Read the first record to check if it looks like headers
@@ -316,16 +315,20 @@ fn merge_chunks(
 
         // Check if first row looks like headers (all fields are strings, no numbers)
         let looks_like_headers = first_record.iter().all(|field| {
-            field.chars().all(|c| c.is_alphabetic() || c == '_' || c == ' ')
+            field
+                .chars()
+                .all(|c| c.is_alphabetic() || c == '_' || c == ' ')
         });
 
         if looks_like_headers {
-            (StringRecord::from(first_record.iter().collect::<Vec<_>>()), true)
+            (
+                StringRecord::from(first_record.iter().collect::<Vec<_>>()),
+                true,
+            )
         } else {
             // Create default headers (0, 1, 2, ...)
-            let default_headers: Vec<String> = (0..first_record.len())
-                .map(|i| i.to_string())
-                .collect();
+            let default_headers: Vec<String> =
+                (0..first_record.len()).map(|i| i.to_string()).collect();
             (StringRecord::from(default_headers), false)
         }
     };
@@ -353,15 +356,16 @@ fn merge_chunks(
     if sort_indices.is_empty() {
         let available_cols: Vec<&str> = headers.iter().collect();
         return Err(anyhow::anyhow!(
-        "No valid sort columns found in merge. Requested: {:?}, Available: {:?}", 
-        sort_columns, available_cols
-    ));
+            "No valid sort columns found in merge. Requested: {:?}, Available: {:?}",
+            sort_columns,
+            available_cols
+        ));
     }
-    
+
     // Open all chunk files
     let mut readers: Vec<Option<CsvReader>> = Vec::with_capacity(chunk_files.len());
     let mut heap = BinaryHeap::with_capacity(chunk_files.len());
-    
+
     // Open first file if it has data
     {
         let file = File::open(&chunk_files[0])
@@ -369,7 +373,7 @@ fn merge_chunks(
         let mut reader = ReaderBuilder::new()
             .has_headers(false)
             .from_reader(BufReader::new(file));
-            
+
         let mut record = StringRecord::new();
         if reader.read_record(&mut record)? {
             heap.push(MergeRecord {
@@ -381,7 +385,7 @@ fn merge_chunks(
             readers.push(None);
         }
     }
-    
+
     // Open remaining chunk files
     for (i, chunk_path) in chunk_files.iter().enumerate().skip(1) {
         match File::open(chunk_path) {
@@ -389,11 +393,12 @@ fn merge_chunks(
                 let mut reader = ReaderBuilder::new()
                     .has_headers(false)
                     .from_reader(BufReader::new(file));
-                    
+
                 let mut record = StringRecord::new();
-                if reader.read_record(&mut record).with_context(|| 
-                    format!("Failed to read record from file: {:?}", chunk_path)
-                )? {
+                if reader
+                    .read_record(&mut record)
+                    .with_context(|| format!("Failed to read record from file: {:?}", chunk_path))?
+                {
                     heap.push(MergeRecord {
                         record,
                         source_index: i,
@@ -402,16 +407,14 @@ fn merge_chunks(
                 } else {
                     readers.push(None);
                 }
-            },
+            }
             Err(e) => {
                 error!("Failed to open chunk file {:?}: {}", chunk_path, e);
                 readers.push(None);
             }
         }
     }
-    
 
-    
     // Create output writer
     let mut writer = {
         let file = File::create(output_path)
@@ -419,19 +422,24 @@ fn merge_chunks(
         let writer = WriterBuilder::new()
             .has_headers(true)
             .from_writer(BufWriter::new(file));
-            
+
         writer
     };
-    
+
     // Write headers
-    writer.write_record(headers.iter())
+    writer
+        .write_record(headers.iter())
         .with_context(|| "Failed to write headers to output file")?;
-    
+
     // Perform k-way merge
-    while let Some(MergeRecord { record, source_index }) = heap.pop() {
+    while let Some(MergeRecord {
+        record,
+        source_index,
+    }) = heap.pop()
+    {
         // Write the smallest record to output
         writer.write_record(&record)?;
-        
+
         // Get the next record from the same source
         if let Some(reader_opt) = readers.get_mut(source_index) {
             if let Some(reader) = reader_opt {
@@ -447,7 +455,7 @@ fn merge_chunks(
             }
         }
     }
-    
+
     writer.flush()?;
     Ok(())
 }
@@ -459,10 +467,8 @@ fn read_headers(file_path: &Path) -> Result<StringRecord> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .from_path(file_path)?;
-    
-    rdr.headers()
-        .map(|h| h.clone())
-        .map_err(Into::into)
+
+    rdr.headers().map(|h| h.clone()).map_err(Into::into)
 }
 
 /// Gets the indices of the columns to sort by
@@ -475,16 +481,27 @@ fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec
 
     for (i, col) in sort_columns.iter().enumerate() {
         let col_trimmed = col.trim();
-        match headers.iter().position(|h| h.trim().eq_ignore_ascii_case(col_trimmed)) {
+        match headers
+            .iter()
+            .position(|h| h.trim().eq_ignore_ascii_case(col_trimmed))
+        {
             Some(idx) => {
                 info!("Sorting by column: '{}' (index {})", col_trimmed, idx);
                 indices.push(idx);
-            },
+            }
             None => {
-                warn!("Warning: Sort column '{}' not found in headers", col_trimmed);
+                warn!(
+                    "Warning: Sort column '{}' not found in headers",
+                    col_trimmed
+                );
                 // Try to suggest similar column names
-                let similar: Vec<&str> = headers.iter()
-                    .filter(|h| h.trim().to_lowercase().contains(&col_trimmed.to_lowercase()))
+                let similar: Vec<&str> = headers
+                    .iter()
+                    .filter(|h| {
+                        h.trim()
+                            .to_lowercase()
+                            .contains(&col_trimmed.to_lowercase())
+                    })
                     .collect();
                 if !similar.is_empty() {
                     warn!("  Did you mean one of these? {:?}", similar);
@@ -494,7 +511,10 @@ fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec
     }
 
     if indices.is_empty() {
-        warn!("No valid sort columns found. Available columns: {:?}", header_vec);
+        warn!(
+            "No valid sort columns found. Available columns: {:?}",
+            header_vec
+        );
     }
 
     indices

@@ -7,8 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use split_merge_hub_demo::parallel_merge::parallel_merge_sort;
 use rayon::slice::ParallelSliceMut;
+use split_merge_hub_demo::parallel_merge::parallel_merge_sort;
 /// A tool for splitting and merging CSV files with parallel processing
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -24,33 +24,33 @@ enum Commands {
         /// Input CSV files to merge
         #[arg(required = true)]
         input_files: Vec<String>,
-        
+
         /// Output file path
         #[arg(short, long)]
         output: String,
-        
+
         /// Columns to sort by (comma-separated)
         #[arg(long, value_delimiter = ',')]
         sort_by: Vec<String>,
-        
+
         /// Chunk size in MB for processing large files
         #[arg(long, default_value = "500")]
         chunk_size: usize,
     },
-    
+
     /// Split a CSV file into smaller chunks
     Split {
         /// Input CSV file to split
         input_file: String,
-        
+
         /// Output directory for split files
         #[arg(short, long, default_value = "split_files")]
         output_dir: String,
-        
+
         /// Maximum number of rows per file
         #[arg(short, long, default_value = "10000")]
         rows_per_file: usize,
-        
+
         /// Columns to sort by (comma-separated)
         #[arg(long, value_delimiter = ',')]
         sort_by: Vec<String>,
@@ -59,29 +59,35 @@ enum Commands {
 
 fn main() -> Result<()> {
     pretty_env_logger::init();
-    
+
     let cli = Cli::parse();
-    
+
     match cli.command {
-        Commands::Merge { input_files, output, sort_by, chunk_size } => {
+        Commands::Merge {
+            input_files,
+            output,
+            sort_by,
+            chunk_size,
+        } => {
             // Set chunk size environment variable for the parallel merge
             std::env::set_var("CHUNK_SIZE_MB", chunk_size.to_string());
             let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
             merge_csv_files(&input_files, &output, &sort_columns)
-        },
-        Commands::Split { input_file, output_dir, rows_per_file, sort_by } => {
+        }
+        Commands::Split {
+            input_file,
+            output_dir,
+            rows_per_file,
+            sort_by,
+        } => {
             let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
             split_csv_file(&input_file, &output_dir, rows_per_file, &sort_columns)
-        },
+        }
     }
 }
 
 /// Merges multiple CSV files into a single output file with optional sorting
-fn merge_csv_files(
-    input_files: &[String],
-    output_file: &str,
-    sort_columns: &[&str],
-) -> Result<()> {
+fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&str]) -> Result<()> {
     info!("Merging {} files into {}", input_files.len(), output_file);
     let start_time = Instant::now();
 
@@ -90,14 +96,13 @@ fn merge_csv_files(
 
     // If no sorting is needed, just concatenate the files
     if sort_columns.is_empty() {
-        let first_file = File::open(&input_paths[0])
-            .context("Failed to open first input file")?;
+        let first_file = File::open(&input_paths[0]).context("Failed to open first input file")?;
         let headers = ReaderBuilder::new()
             .has_headers(true)
             .from_reader(&first_file)
             .headers()?
             .clone();
-            
+
         concatenate_files(&input_paths, output_file, &headers)?;
     } else {
         // Use parallel merge sort for large files with sorting
@@ -112,21 +117,17 @@ fn merge_csv_files(
 }
 
 /// Concatenates multiple CSV files without sorting
-fn concatenate_files(
-    files: &[PathBuf],
-    output_file: &str,
-    headers: &StringRecord,
-) -> Result<()> {
+fn concatenate_files(files: &[PathBuf], output_file: &str, headers: &StringRecord) -> Result<()> {
     info!("Concatenating {} files", files.len());
-    
-    let output = File::create(output_file)
-        .context("Failed to create output file")?;
+
+    let output = File::create(output_file).context("Failed to create output file")?;
     let mut writer = WriterBuilder::new()
         .has_headers(true)
         .from_writer(io::BufWriter::new(output));
 
     // Write headers
-    writer.write_record(headers.iter())
+    writer
+        .write_record(headers.iter())
         .context("Failed to write headers")?;
 
     // Concatenate all files
@@ -138,7 +139,8 @@ fn concatenate_files(
 
         for result in rdr.records() {
             let record = result.context("Failed to read record")?;
-            writer.write_record(&record)
+            writer
+                .write_record(&record)
                 .context("Failed to write record")?;
         }
     }
@@ -154,41 +156,48 @@ fn split_csv_file(
     rows_per_file: usize,
     sort_columns: &[&str],
 ) -> Result<()> {
-    info!("Splitting {} into chunks of {} rows", input_file, rows_per_file);
-    
+    info!(
+        "Splitting {} into chunks of {} rows",
+        input_file, rows_per_file
+    );
+
     // Create output directory if it doesn't exist
     fs::create_dir_all(output_dir).context("Failed to create output directory")?;
-    
+
     // Create a temporary directory for sorting
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    
+
     // If sorting is needed, sort the file first
     let sorted_file = if !sort_columns.is_empty() {
         let sorted_path = temp_dir.path().join("sorted.csv");
-        external_sort(Path::new(input_file), &sorted_path, sort_columns, temp_dir.path())?;
+        external_sort(
+            Path::new(input_file),
+            &sorted_path,
+            sort_columns,
+            temp_dir.path(),
+        )?;
         sorted_path
     } else {
         PathBuf::from(input_file)
     };
-    
+
     // Open the input file
-    let file = File::open(&sorted_file)
-        .context("Failed to open input file")?;
+    let file = File::open(&sorted_file).context("Failed to open input file")?;
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .from_reader(io::BufReader::new(file));
-    
+
     // Get headers
     let headers = rdr.headers()?.clone();
-    
+
     // Process the file in chunks
     let mut chunk_num = 0;
     let mut current_chunk: Vec<StringRecord> = Vec::with_capacity(rows_per_file);
-    
+
     for result in rdr.records() {
         let record = result.context("Failed to read record")?;
         current_chunk.push(record);
-        
+
         if current_chunk.len() >= rows_per_file {
             write_chunk(
                 output_dir,
@@ -200,12 +209,12 @@ fn split_csv_file(
                     .unwrap_or("split"),
                 chunk_num,
             )?;
-            
+
             chunk_num += 1;
             current_chunk.clear();
         }
     }
-    
+
     // Write the last chunk if it's not empty
     if !current_chunk.is_empty() {
         write_chunk(
@@ -219,7 +228,7 @@ fn split_csv_file(
             chunk_num,
         )?;
     }
-    
+
     info!("Split into {} files in {}", chunk_num + 1, output_dir);
     Ok(())
 }
@@ -232,22 +241,23 @@ fn write_chunk(
     base_name: &str,
     chunk_num: usize,
 ) -> Result<()> {
-    let output_path = Path::new(output_dir).join(format!("{}_part_{:04}.csv", base_name, chunk_num));
-    
+    let output_path =
+        Path::new(output_dir).join(format!("{}_part_{:04}.csv", base_name, chunk_num));
+
     let mut wtr = WriterBuilder::new()
         .has_headers(true)
         .from_path(&output_path)
         .context("Failed to create output file")?;
-    
+
     // Write headers
     wtr.write_record(headers.iter())
         .context("Failed to write headers")?;
-    
+
     // Write records
     for record in records {
         wtr.write_record(record)?;
     }
-    
+
     wtr.flush()?;
     Ok(())
 }
@@ -260,28 +270,28 @@ fn external_sort(
     _temp_dir: &Path,
 ) -> Result<()> {
     info!("Sorting {:?} by {:?}", input_path, sort_columns);
-    
+
     // Read headers
     let file = File::open(input_path).context("Failed to open input file")?;
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .from_reader(io::BufReader::new(file));
-    
+
     let headers = rdr.headers()?.clone();
-    
+
     // Get column indices for sorting
     let column_indices: Vec<usize> = sort_columns
         .iter()
         .filter_map(|col| headers.iter().position(|h| h == *col))
         .collect();
-    
+
     if column_indices.is_empty() {
         return Err(anyhow::anyhow!("No valid sort columns found"));
     }
-    
+
     // Read all records
     let mut records: Vec<StringRecord> = rdr.records().collect::<Result<_, _>>()?;
-    
+
     // Sort records in parallel
     records.par_sort_by(|a, b| {
         for &idx in &column_indices {
@@ -294,19 +304,19 @@ fn external_sort(
         }
         std::cmp::Ordering::Equal
     });
-    
+
     // Write sorted records to output
     let mut wtr = WriterBuilder::new()
         .has_headers(true)
         .from_path(output_path)
         .context("Failed to create output file")?;
-    
+
     wtr.write_record(headers.iter())?;
     for record in records {
         wtr.write_record(&record)?;
     }
-    
+
     wtr.flush()?;
-    
+
     Ok(())
 }
