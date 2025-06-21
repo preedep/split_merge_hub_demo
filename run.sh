@@ -10,9 +10,11 @@ OUTPUT_DIR="merge_files"
 OUTPUT_FILE="${OUTPUT_DIR}/merged_accounts.csv"
 SORT_BY="account_no"  # Default sort column
 RAYON_NUM_THREADS="8"
+MERGE_K="8"  # Default k-way merge factor; adjust as needed for your hardware
 # Set log level (can be overridden by environment variable)
 export RUST_LOG_STYLE="always"
 export RUST_LOG="debug"
+export MERGE_K
 
 # Ensure input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
@@ -74,11 +76,11 @@ fi
 
 # Check available memory and adjust chunk size if needed
 TOTAL_MEM_MB=$(($(sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1048576))  # Default to 8GB if can't detect
-CHUNK_SIZE_MB=512  # Default chunk size in MB
+CHUNK_SIZE_MB=256  # Default chunk size in MB
 
 # If we have less than 4GB of RAM, use smaller chunks
 if [ "$TOTAL_MEM_MB" -lt 4096 ]; then
-    CHUNK_SIZE_MB=256
+    CHUNK_SIZE_MB=128
 fi
 
 echo "   Detected ${TOTAL_MEM_MB}MB of system memory"

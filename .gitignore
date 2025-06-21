@@ -25,13 +25,7 @@ target/
 
 /target
 /.idea/*
-/split_output/*
-/test_data/*
-/demo_*/*
 /large_files/*
+/merge_files/*
 
-/test_sort1.csv
-/test_sort2.csv
-/test_sorted_output.csv
-/merge_files/merged_accounts.csv
-/merge_files/merge_round0_0.csv
+

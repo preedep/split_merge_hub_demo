@@ -229,34 +229,53 @@ fn merge_two_chunks(
     merge_chunks(&vec![chunk_a.clone(), chunk_b.clone()], output_path, sort_columns)
 }
 
+/// Merge chunk files in parallel, with configurable k-way merge and temp cleanup
 pub fn parallel_merge_chunks(
     mut chunk_files: Vec<PathBuf>,
     output_path: &Path,
     sort_columns: &[&str],
+    k: usize, // new parameter for k-way merge
 ) -> Result<()> {
     let t0 = Instant::now();
     let mut round = 0;
     let parent_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
-    debug!("Starting parallel merge with {} chunks", chunk_files.len().to_formatted_string(&Locale::en));
-    
+    debug!("Starting parallel merge with {} chunks (k-way: {})", chunk_files.len().to_formatted_string(&Locale::en), k);
     while chunk_files.len() > 1 {
-        let pairs: Vec<_> = chunk_files.chunks(2).collect();
-        let results: Vec<anyhow::Result<PathBuf>> = pairs
+        let groups: Vec<_> = chunk_files.chunks(k).map(|g| g.to_vec()).collect();
+        let results: Vec<anyhow::Result<PathBuf>> = groups
             .par_iter()
             .enumerate()
-            .map(|(idx, pair)| {
-                if pair.len() == 2 {
+            .map(|(idx, group)| {
+                if group.len() > 1 {
                     let out = parent_dir.join(format!("merge_round{}_{}.csv", round, idx));
-                    merge_two_chunks(&pair[0], &pair[1], &out, sort_columns)?;
+                    merge_chunks(&group, &out, sort_columns)?;
                     Ok(out)
                 } else {
-                    Ok(pair[0].clone())
+                    Ok(group[0].clone())
                 }
             })
             .collect();
         let mut merged_files = Vec::new();
-        for res in results {
-            merged_files.push(res?);
+        let mut to_delete = Vec::new();
+        for (i, res) in results.into_iter().enumerate() {
+            let merged = res?;
+            let group = &groups[i];
+            if group.len() > 1 {
+                for f in group {
+                    if *f != merged {
+                        to_delete.push(f.clone());
+                    }
+                }
+            }
+            merged_files.push(merged);
+        }
+        // Delete temp files immediately after round
+        for f in &to_delete {
+            if let Err(e) = std::fs::remove_file(f) {
+                warn!("Failed to delete temp file {:?}: {}", f, e);
+            } else {
+                debug!("Deleted temp file: {:?}", f);
+            }
         }
         chunk_files = merged_files;
         round += 1;
@@ -376,13 +395,12 @@ pub fn parallel_merge_sort(
     info!("Validated headers across all input files: {:?}", headers.iter().collect::<Vec<_>>());
     info!("Starting parallel merge sort for {} files", input_paths.len().to_formatted_string(&Locale::en));
     let temp_dir = TempDir::new()?;
-    let chunk_size_mb = std::env::var("CHUNK_SIZE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
-    debug!("Using chunk size: {} MB", chunk_size_mb);
     let total_start = Instant::now();
-
-    info!("Starting split (chunking) phase...");
     let split_start = Instant::now();
-    // Split files into sorted chunks in parallel
+    let chunk_size_mb = std::env::var("CHUNK_SIZE_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
     let all_chunks: Vec<PathBuf> = input_paths
         .par_iter()
         .map(|path| split_file_to_chunks(path, &temp_dir, sort_columns, chunk_size_mb, &headers))
@@ -394,7 +412,19 @@ pub fn parallel_merge_sort(
 
     info!("Starting merge phase...");
     let merge_start = Instant::now();
-    parallel_merge_chunks(all_chunks, output_path.as_ref(), sort_columns)?;
+    // Default k=2 for backward compatibility, or get from env
+    let k = match std::env::var("MERGE_K") {
+        Ok(val) => match val.parse::<usize>() {
+            Ok(parsed) if parsed >= 2 => parsed,
+            _ => {
+                warn!("MERGE_K is set but invalid ({}), using default k=2", val);
+                2
+            }
+        },
+        Err(_) => 2,
+    };
+    info!("Using k-way merge: k={}", k);
+    parallel_merge_chunks(all_chunks, output_path.as_ref(), sort_columns, k)?;
     info!("Merge phase finished in: {:?}", merge_start.elapsed());
 
     info!("Total merge+sort finished in: {:?}", total_start.elapsed());
