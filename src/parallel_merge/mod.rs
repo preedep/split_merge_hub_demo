@@ -128,7 +128,75 @@ fn get_first_record(path: &Path) -> Result<StringRecord> {
     }
 }
 
-// --- Main k-way merge for chunk files ---
+/// Merges multiple CSV chunk files into a single sorted CSV file.
+///
+/// # Arguments
+///
+/// * `chunk_files` - A slice of `PathBuf` representing the paths to the chunk files that need to be merged.
+///
+/// * `output_path` - A `Path` reference denoting the path to the output CSV file where the merged data will be written.
+///
+/// * `sort_columns` - A slice of `&str` that specifies the columns (either by name or index) to use for sorting the records.
+///
+/// # Returns
+///
+/// * `Result<()>` - Returns `Ok(())` if the operation completes successfully. Returns an error if any stage of the merging or writing fails.
+///
+/// # Behavior
+///
+/// * The function checks whether the provided `chunk_files` array is empty and exits early with `Ok(())` if it is.
+/// * Validates that all chunk files have matching headers (if headers exist).
+/// * Creates a sorted output file by iteratively reading records from the input chunk files and merging them using the provided `sort_columns`.
+/// * Uses a binary heap to perform an efficient merge of sorted data from the various input chunk files.
+///
+/// # Special Cases
+///
+/// * If the chunk files contain headers, the function checks whether the first record in each chunk file matches
+///   the headers of the first chunk. If they do not match, an error is returned.
+/// * If no headers are detected, the function provides default headers (using column indices as names).
+/// * If no valid `sort_columns` are provided, the function defaults to sorting by the first column.
+///
+/// # Environment Variables
+///
+/// * `MERGE_BUF_MB` - Optionally specifies the buffer size in MB to use when reading and writing files. Defaults to 32 MB if not set.
+///
+/// # Errors
+///
+/// * Returns an error if any of the input chunk files fail to open.
+/// * Returns an error if writing to the output file fails.
+/// * Returns an error if there is a mismatch between headers in the chunk files.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// let chunk_files = vec![
+///     PathBuf::from("chunk1.csv"),
+///     PathBuf::from("chunk2.csv"),
+///     PathBuf::from("chunk3.csv"),
+/// ];
+/// let output_path = PathBuf::from("merged_output.csv");
+/// let sort_columns = &["name", "age"];
+///
+/// if let Err(e) = merge_chunks(&chunk_files, &output_path, sort_columns) {
+///     eprintln!("Error during merging: {}", e);
+/// }
+/// ```
+///
+/// # Performance
+///
+/// * Uses buffered readers and writers to minimize I/O overhead.
+/// * Sorts using a binary heap for optimal merge efficiency.
+///
+/// # Logging
+///
+/// * Logs useful information such as the number of chunks being merged, warnings about sorting columns, and any errors encountered.
+///
+/// # Debugging
+///
+/// * The function logs the time taken to perform the merging operation when debug mode is enabled.
+///
 pub fn merge_chunks(
     chunk_files: &[PathBuf],
     output_path: &Path,
@@ -381,7 +449,70 @@ pub fn parallel_merge_chunks(
     Ok(())
 }
 
-// --- Split a single input file into sorted chunks in parallel ---
+/// Splits a large CSV file into smaller, sorted chunks with a specified size.
+///
+/// # Arguments
+/// - `file_path` - A reference to the path of the input CSV file to be split.
+/// - `temp_dir` - A reference to a temporary directory path where the chunk files will be stored.
+/// - `sort_columns` - A slice of string references representing the column names to sort each chunk by.
+/// - `chunk_size_mb` - The size of each chunk in megabytes (MB).
+/// - `headers` - A reference to the CSV headers (`StringRecord`) to include in each generated chunk.
+///
+/// # Returns
+/// A `Result` containing:
+/// - On success: A vector of `PathBuf` objects, each representing the path to a generated chunk file.
+/// - On failure: An error of type `std::io::Error` or other possible errors encountered during file operations.
+///
+/// # Functionality
+/// 1. The function reads the input CSV file in chunks, each of size approximately `chunk_size_mb` MB.
+/// 2. Each chunk is then sorted based on the columns specified in `sort_columns`.
+/// 3. The sorted data is written to separate chunk files in the given `temp_dir`.
+/// 4. If the number of chunks exceeds the available logical CPUs, the function uses a Rayon thread
+///    pool for parallel processing to optimize chunk generation.
+/// 5. At the end of processing, the function ensures all chunk paths are sorted deterministically
+///    before returning the paths.
+///
+/// # Logging
+/// - Logs the beginning and end of the process, including the input file, chunk sizes, and total chunks generated.
+/// - Logs progress for each chunk, including its size and output path.
+/// - Logs any errors encountered while writing individual chunk files.
+///
+/// # Errors
+/// - Returns an error if the input file cannot be opened or read.
+/// - Returns an error if writing a chunk to the `temp_dir` fails.
+/// - Captures and logs errors during chunk writing or sorting.
+///
+/// # Example
+/// ```rust
+/// use tempfile::TempDir;
+/// use csv::StringRecord;
+/// use std::path::PathBuf;
+///
+/// let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+/// let file_path = PathBuf::from("input.csv");
+/// let sort_columns = vec!["column1", "column2"];
+/// let chunk_size_mb = 10; // 10 MB per chunk
+/// let headers = StringRecord::from(vec!["column1", "column2", "column3"]);
+///
+/// let chunk_paths = split_file_to_chunks(
+///     &file_path,
+///     &temp_dir,
+///     &sort_columns,
+///     chunk_size_mb,
+///     &headers,
+/// ).expect("Failed to split file");
+///
+/// println!("Generated {} chunks.", chunk_paths.len());
+/// ```
+///
+/// # Internal Parallelism
+/// - The function uses a Rayon thread pool with the number of threads matching the system's logical CPU count.
+/// - Parallelism ensures that writing and sorting large chunks is efficient without blocking the main thread.
+///
+/// # Notes
+/// - The function assumes the input CSV file has a valid structure and contains proper headers.
+/// - The temporary file paths are managed by `temp_dir`, and these files are typically deleted when the
+///   `TempDir` instance is dropped, ensuring temporary storage is cleaned up after use.
 fn split_file_to_chunks(
     file_path: &Path,
     temp_dir: &TempDir,
@@ -534,7 +665,52 @@ fn compare_records(
     std::cmp::Ordering::Equal
 }
 
-// --- Main entry point for CLI/integration ---
+///
+/// Performs a parallel merge sort on multiple input files, producing a single sorted output file.
+///
+/// # Arguments
+/// * `input_paths` - A slice of `PathBuf` representing the paths to the input files that need to be sorted.
+/// * `output_path` - The path to the output file where the sorted data will be written.
+/// * `sort_columns` - A slice of strings representing the column names by which the data should be sorted.
+///
+/// # Environment Variables
+/// * `CHUNK_SIZE_MB` - Optional. Specifies the size (in MB) of chunks the input files will be split into during the split phase. Defaults to `256` if not provided or invalid.
+/// * `MERGE_K` - Optional. Specifies the number of files to merge at a time in the k-way merge phase. Defaults to `2` if not provided, invalid, or less than `2`.
+///
+/// # Process
+/// 1. Validate that all input files have consistent headers.
+/// 2. Split the input files into smaller chunks in parallel, based on the chunk size.
+/// 3. Perform a k-way merge of the chunks in parallel, producing the final sorted output file.
+///
+/// # Returns
+/// * `Ok(())` if the operation completes successfully.
+/// * `Err(anyhow::Error)` if any step encounters an error (e.g., no input files, invalid headers, file system failures).
+///
+/// # Errors
+/// * Returns an error if no input files are provided.
+/// * Returns an error if the headers across input files are inconsistent.
+/// * Any I/O or parsing failures during the process will also result in an error.
+///
+/// # Notes
+/// * The headers for all input files must match for the sorting to proceed.
+/// * The number of files in the k-way merge phase (`MERGE_K`) is determined dynamically based on the environment variable or defaults to `2`.
+/// * Temporary intermediate files are created during the split and merge phases and are automatically cleaned up after completion or failure.
+///
+/// # Examples
+/// ```
+/// use std::path::PathBuf;
+/// use anyhow::Result;
+///
+/// fn main() -> Result<()> {
+///     let input_files = vec![PathBuf::from("file1.csv"), PathBuf::from("file2.csv")];
+///     let output_file = "sorted_output.csv";
+///     let sort_columns = vec!["column1", "column2"];
+///
+///     parallel_merge_sort(&input_files, output_file, &sort_columns)?;
+///
+///     Ok(())
+/// }
+/// ```
 pub fn parallel_merge_sort(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
