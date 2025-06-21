@@ -60,32 +60,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     // Initialize logger with timestamp
-    unsafe {
-        std::env::set_var(
-            "RUST_LOG_STYLE",
-            "always"
-        );
-    }
-    unsafe {
-        std::env::set_var(
-            "RUST_LOG_FORMAT",
-            "[{time}] {level} {target} > {args}"
-        );
-    }
-    // Use pretty_env_logger with custom format
-    pretty_env_logger::formatted_timed_builder()
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(
-                buf,
-                "{} [{}] {} > {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.target(),
-                record.args()
-            )
-        })
-        .init();
+    pretty_env_logger::init();
 
     // ... rest of the code remains the same ...
     let cli = Cli::parse();

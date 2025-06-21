@@ -9,9 +9,10 @@ INPUT_DIR="large_files"
 OUTPUT_DIR="merge_files"
 OUTPUT_FILE="${OUTPUT_DIR}/merged_accounts.csv"
 SORT_BY="account_no"  # Default sort column
-RAYON_NUM_THREADS="8"
+RAYON_NUM_THREADS="16"
 # Set log level (can be overridden by environment variable)
-export RUST_LOG=${RUST_LOG:-debug}
+export RUST_LOG_STYLE="always"
+export RUST_LOG="debug"
 
 # Ensure input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
