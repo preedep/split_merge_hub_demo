@@ -291,6 +291,7 @@ fn split_file_to_chunks(
             let headers = headers.clone();
             let sort_columns = sort_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             pool.install(|| {
+                debug!("Writing chunk: {:?} with {} records", chunk_path, chunk.len());
                 let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
                 if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
                     error!("Chunk write failed: {:?}", e);
@@ -311,6 +312,7 @@ fn split_file_to_chunks(
         let sort_columns = sort_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let chunk = std::mem::take(&mut records);
         pool.install(|| {
+            debug!("Writing chunk: {:?} with {} records", chunk_path, chunk.len());
             let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
             if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
                 error!("Chunk write failed: {:?}", e);
