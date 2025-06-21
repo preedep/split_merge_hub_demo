@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
-use chrono::Local;
 use log::{debug, info};
 use std::fs::{self, File};
 use std::io;
@@ -76,7 +76,7 @@ fn main() -> Result<()> {
             std::env::set_var("CHUNK_SIZE_MB", chunk_size.to_string());
             let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
             merge_csv_files(&input_files, &output, &sort_columns)
-        }
+        },
         Commands::Split {
             input_file,
             output_dir,

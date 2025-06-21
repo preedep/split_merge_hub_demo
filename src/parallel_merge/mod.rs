@@ -1,18 +1,18 @@
 // --- Imports ---
+use anyhow::{Context, Result};
+use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use log::{debug, error, info, warn};
+use num_cpus;
+use num_format::{Locale, ToFormattedString};
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
-use csv::{ReaderBuilder, StringRecord, WriterBuilder};
-use log::{debug, error, info, warn};
-use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
-use tempfile::TempDir;
-use num_cpus;
-use num_format::{Locale, ToFormattedString};
 use std::time::Instant;
+use tempfile::TempDir;
 
 // --- MergeRecord struct for heap ---
 #[derive(Debug)]
@@ -23,7 +23,10 @@ struct MergeRecord {
 
 impl Ord for MergeRecord {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.record.as_slice().cmp(other.record.as_slice()).reverse()
+        self.record
+            .as_slice()
+            .cmp(other.record.as_slice())
+            .reverse()
     }
 }
 
@@ -45,8 +48,8 @@ impl Eq for MergeRecord {}
 fn validate_headers(input_paths: &[PathBuf]) -> Result<StringRecord> {
     let mut headers: Option<StringRecord> = None;
     for path in input_paths {
-        let file = File::open(path)
-            .with_context(|| format!("Failed to open file: {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
         let mut rdr = ReaderBuilder::new()
             .has_headers(true)
             .from_reader(BufReader::new(file));
@@ -75,16 +78,26 @@ fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec
     info!("Requested sort columns: {:?}", sort_columns);
     for col in sort_columns.iter() {
         let col_trimmed = col.trim();
-        match headers.iter().position(|h| h.trim().eq_ignore_ascii_case(col_trimmed)) {
+        match headers
+            .iter()
+            .position(|h| h.trim().eq_ignore_ascii_case(col_trimmed))
+        {
             Some(idx) => {
                 info!("Sorting by column: '{}' (index {})", col_trimmed, idx);
                 indices.push(idx);
             }
             None => {
-                warn!("Warning: Sort column '{}' not found in headers", col_trimmed);
+                warn!(
+                    "Warning: Sort column '{}' not found in headers",
+                    col_trimmed
+                );
                 let similar: Vec<&str> = headers
                     .iter()
-                    .filter(|h| h.trim().to_lowercase().contains(&col_trimmed.to_lowercase()))
+                    .filter(|h| {
+                        h.trim()
+                            .to_lowercase()
+                            .contains(&col_trimmed.to_lowercase())
+                    })
                     .collect();
                 if !similar.is_empty() {
                     warn!("  Did you mean one of these? {:?}", similar);
@@ -93,15 +106,18 @@ fn get_sort_column_indices(headers: &StringRecord, sort_columns: &[&str]) -> Vec
         }
     }
     if indices.is_empty() {
-        warn!("No valid sort columns found. Available columns: {:?}", header_vec);
+        warn!(
+            "No valid sort columns found. Available columns: {:?}",
+            header_vec
+        );
     }
     indices
 }
 
 // --- Get first record of a file (for header detection) ---
 fn get_first_record(path: &Path) -> Result<StringRecord> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open file: {}", path.display()))?;
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
         .from_reader(BufReader::new(file));
@@ -113,24 +129,33 @@ fn get_first_record(path: &Path) -> Result<StringRecord> {
 }
 
 // --- Main k-way merge for chunk files ---
-pub fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &[&str]) -> Result<()> {
+pub fn merge_chunks(
+    chunk_files: &[PathBuf],
+    output_path: &Path,
+    sort_columns: &[&str],
+) -> Result<()> {
     let t0 = Instant::now();
     if chunk_files.is_empty() {
         return Ok(());
     }
-    info!("Merging {} chunks into {:?}", chunk_files.len().to_formatted_string(&Locale::en), output_path);
+    info!(
+        "Merging {} chunks into {:?}",
+        chunk_files.len().to_formatted_string(&Locale::en),
+        output_path
+    );
     // Read headers from first chunk
     let (headers, has_headers) = {
         let first_record = get_first_record(&chunk_files[0])?;
         let looks_like_headers = first_record.iter().all(|field| {
-            field.chars().all(|c| c.is_alphabetic() || c == '_' || c == ' ')
+            field
+                .chars()
+                .all(|c| c.is_alphabetic() || c == '_' || c == ' ')
         });
         if looks_like_headers {
             (first_record, true)
         } else {
-            let default_headers: Vec<String> = (0..first_record.len())
-                .map(|i| i.to_string())
-                .collect();
+            let default_headers: Vec<String> =
+                (0..first_record.len()).map(|i| i.to_string()).collect();
             (StringRecord::from(default_headers), false)
         }
     };
@@ -162,14 +187,20 @@ pub fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &
     } else {
         sort_indices
     };
-    let mut readers: Vec<Option<csv::Reader<BufReader<File>>>> = Vec::with_capacity(chunk_files.len());
+    let buffer_size_mb = std::env::var("MERGE_BUF_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32); // default 32MB
+    let buffer_size = buffer_size_mb * 1024 * 1024;
+    let mut readers: Vec<Option<csv::Reader<BufReader<File>>>> =
+        Vec::with_capacity(chunk_files.len());
     let mut heap = BinaryHeap::with_capacity(chunk_files.len());
     for (i, chunk_path) in chunk_files.iter().enumerate() {
         match File::open(chunk_path) {
             Ok(file) => {
                 let mut reader = ReaderBuilder::new()
                     .has_headers(false)
-                    .from_reader(BufReader::new(file));
+                    .from_reader(BufReader::with_capacity(buffer_size, file));
                 let mut record = StringRecord::new();
                 // Always skip the first record if it is a header row and this chunk has headers
                 if has_headers {
@@ -179,7 +210,10 @@ pub fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &
                     }
                 }
                 if reader.read_record(&mut record)? {
-                    heap.push(MergeRecord { record, source_index: i });
+                    heap.push(MergeRecord {
+                        record,
+                        source_index: i,
+                    });
                     readers.push(Some(reader));
                 } else {
                     readers.push(None);
@@ -196,18 +230,25 @@ pub fn merge_chunks(chunk_files: &[PathBuf], output_path: &Path, sort_columns: &
             .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
         WriterBuilder::new()
             .has_headers(true)
-            .from_writer(BufWriter::new(file))
+            .from_writer(BufWriter::with_capacity(buffer_size, file))
     };
     writer
         .write_record(headers.iter())
         .with_context(|| "Failed to write headers to output file")?;
-    while let Some(MergeRecord { record, source_index }) = heap.pop() {
+    while let Some(MergeRecord {
+        record,
+        source_index,
+    }) = heap.pop()
+    {
         writer.write_record(&record)?;
         if let Some(reader_opt) = readers.get_mut(source_index) {
             if let Some(reader) = reader_opt {
                 let mut record = StringRecord::new();
                 if reader.read_record(&mut record)? {
-                    heap.push(MergeRecord { record, source_index });
+                    heap.push(MergeRecord {
+                        record,
+                        source_index,
+                    });
                 } else {
                     *reader_opt = None;
                 }
@@ -226,10 +267,52 @@ fn merge_two_chunks(
     output_path: &Path,
     sort_columns: &[&str],
 ) -> Result<()> {
-    merge_chunks(&vec![chunk_a.clone(), chunk_b.clone()], output_path, sort_columns)
+    merge_chunks(
+        &vec![chunk_a.clone(), chunk_b.clone()],
+        output_path,
+        sort_columns,
+    )
 }
 
-/// Merge chunk files in parallel, with configurable k-way merge and temp cleanup
+/// Merges multiple sorted chunk files into a single sorted output file in parallel using a k-way merge approach.
+///
+/// # Arguments
+///
+/// * `chunk_files` - A vector of `PathBuf` objects representing the paths to the sorted chunk files to merge.
+/// * `output_path` - A reference to a `Path` where the resulting merged file will be written.
+/// * `sort_columns` - A slice of strings that specifies the columns which determine the order of sorting in the merged file.
+/// * `k` - The number of files to include in each merge group during the k-way merge process.
+///
+/// # Environment Variables
+///
+/// * `MERGE_PARALLEL_GROUPS` - Optional environment variable that determines the number of parallel groups for merging. If not set, defaults to `4`.
+///
+/// # Process
+///
+/// 1. If the number of chunk files exceeds `k * MERGE_PARALLEL_GROUPS`, the files are divided into multiple parallel groups for merging.
+/// 2. Each group is merged in parallel into a temporary file.
+/// 3. The temporary files created from the first pass are merged again in rounds until only one file remains.
+/// 4. Temporary files are deleted after each round of merging to save disk space.
+/// 5. Finally, the last remaining file is renamed to the specified `output_path`.
+///
+/// # Parallelism
+///
+/// The merging process is performed in parallel within groups using the `par_iter` from the `rayon` crate. Each merge operation within a group is performed concurrently to speed up the process.
+///
+/// # Errors
+///
+/// This function returns a `Result<()>`:
+/// * Returns `Ok(())` if the merging process completes successfully.
+/// * Returns an error if any file operation (e.g., reading, writing, deleting a file) fails, or if merging fails.
+///
+/// # Logging
+///
+/// This function emits debug logs to provide insights into the merge process:
+/// * Logs the start and end of the merging process, including elapsed time.
+/// * Logs the number of chunk files and `k` value at the start of the merge.
+/// * Logs file deletions and any errors encountered while deleting temporary files.
+///
+
 pub fn parallel_merge_chunks(
     mut chunk_files: Vec<PathBuf>,
     output_path: &Path,
@@ -239,9 +322,24 @@ pub fn parallel_merge_chunks(
     let t0 = Instant::now();
     let mut round = 0;
     let parent_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
-    debug!("Starting parallel merge with {} chunks (k-way: {})", chunk_files.len().to_formatted_string(&Locale::en), k);
+    debug!(
+        "Starting parallel merge with {} chunks (k-way: {})",
+        chunk_files.len().to_formatted_string(&Locale::en),
+        k
+    );
+    let parallel_groups = std::env::var("MERGE_PARALLEL_GROUPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4);
     while chunk_files.len() > 1 {
-        let groups: Vec<_> = chunk_files.chunks(k).map(|g| g.to_vec()).collect();
+        // If this is the last round and chunk_files > k*parallel_groups, do parallel group merge for more CPU usage
+        let groups: Vec<_> = if chunk_files.len() > k * parallel_groups {
+            // Split into parallel_groups groups, each with ~chunk_files.len()/parallel_groups files
+            let group_size = (chunk_files.len() + parallel_groups - 1) / parallel_groups;
+            chunk_files.chunks(group_size).map(|g| g.to_vec()).collect()
+        } else {
+            chunk_files.chunks(k).map(|g| g.to_vec()).collect()
+        };
         let results: Vec<anyhow::Result<PathBuf>> = groups
             .par_iter()
             .enumerate()
@@ -262,9 +360,7 @@ pub fn parallel_merge_chunks(
             let group = &groups[i];
             if group.len() > 1 {
                 for f in group {
-                    if *f != merged {
-                        to_delete.push(f.clone());
-                    }
+                    to_delete.push(f.clone());
                 }
             }
             merged_files.push(merged);
@@ -294,8 +390,11 @@ fn split_file_to_chunks(
     headers: &StringRecord,
 ) -> Result<Vec<PathBuf>> {
     let t0 = Instant::now();
-    debug!("Splitting file: {:?} into chunks of {} MB", file_path, chunk_size_mb);
-    
+    debug!(
+        "Splitting file: {:?} into chunks of {} MB",
+        file_path, chunk_size_mb
+    );
+
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .from_reader(BufReader::new(File::open(file_path)?));
@@ -305,21 +404,36 @@ fn split_file_to_chunks(
     let chunk_size = chunk_size_mb * 1024 * 1024;
     let chunk_paths = Arc::new(Mutex::new(Vec::new()));
     let max_parallel_chunks = num_cpus::get().max(2); // Use number of logical CPUs, at least 2
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(max_parallel_chunks).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_parallel_chunks)
+        .build()
+        .unwrap();
     for result in rdr.records() {
         let record = result?;
         current_size += record.as_slice().len();
         records.push(record);
         if current_size >= chunk_size {
             let chunk = std::mem::take(&mut records);
-            let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
+            let chunk_path = temp_dir.path().join(format!(
+                "chunk_{}_{}.csv",
+                file_path.file_stem().unwrap().to_string_lossy(),
+                chunk_idx
+            ));
             let chunk_paths = Arc::clone(&chunk_paths);
             let headers = headers.clone();
-            let sort_columns = sort_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let sort_columns = sort_columns
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
             pool.install(|| {
-                debug!("Writing chunk: {:?} with {} records", chunk_path, chunk.len().to_formatted_string(&Locale::en));
+                debug!(
+                    "Writing chunk: {:?} with {} records",
+                    chunk_path,
+                    chunk.len().to_formatted_string(&Locale::en)
+                );
                 let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
+                if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref)
+                {
                     error!("Chunk write failed: {:?}", e);
                 } else {
                     let mut paths = chunk_paths.lock().unwrap();
@@ -331,14 +445,29 @@ fn split_file_to_chunks(
         }
     }
     if !records.is_empty() {
-        let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
-        debug!("Writing last chunk: {:?} with {} records", chunk_path, records.len().to_formatted_string(&Locale::en));
+        let chunk_path = temp_dir.path().join(format!(
+            "chunk_{}_{}.csv",
+            file_path.file_stem().unwrap().to_string_lossy(),
+            chunk_idx
+        ));
+        debug!(
+            "Writing last chunk: {:?} with {} records",
+            chunk_path,
+            records.len().to_formatted_string(&Locale::en)
+        );
         let chunk_paths = Arc::clone(&chunk_paths);
         let headers = headers.clone();
-        let sort_columns = sort_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sort_columns = sort_columns
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
         let chunk = std::mem::take(&mut records);
         pool.install(|| {
-            debug!("Writing chunk: {:?} with {} records", chunk_path, chunk.len().to_formatted_string(&Locale::en));
+            debug!(
+                "Writing chunk: {:?} with {} records",
+                chunk_path,
+                chunk.len().to_formatted_string(&Locale::en)
+            );
             let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
             if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
                 error!("Chunk write failed: {:?}", e);
@@ -351,28 +480,51 @@ fn split_file_to_chunks(
     let mut paths = Arc::try_unwrap(chunk_paths)
         .map(|mutex| mutex.into_inner().unwrap())
         .unwrap_or_else(|arc| arc.lock().unwrap().clone());
-    debug!("Created {} chunks for file {:?}", paths.len().to_formatted_string(&Locale::en), file_path);
-    debug!("split_file_to_chunks for {:?} finished in: {:?}", file_path, t0.elapsed());
+    debug!(
+        "Created {} chunks for file {:?}",
+        paths.len().to_formatted_string(&Locale::en),
+        file_path
+    );
+    debug!(
+        "split_file_to_chunks for {:?} finished in: {:?}",
+        file_path,
+        t0.elapsed()
+    );
     paths.sort(); // Ensure deterministic order
     Ok(paths)
 }
 
-fn write_sorted_chunk(records: &[StringRecord], chunk_path: &Path, headers: &StringRecord, sort_columns: &[&str]) -> Result<()> {
+fn write_sorted_chunk(
+    records: &[StringRecord],
+    chunk_path: &Path,
+    headers: &StringRecord,
+    sort_columns: &[&str],
+) -> Result<()> {
     let t0 = Instant::now();
     let mut sorted_records = records.to_vec();
     let sort_indices = get_sort_column_indices(headers, sort_columns);
     sorted_records.sort_by(|a, b| compare_records(a, b, &sort_indices));
-    let mut wtr = WriterBuilder::new().has_headers(true).from_path(chunk_path)?;
+    let mut wtr = WriterBuilder::new()
+        .has_headers(true)
+        .from_path(chunk_path)?;
     wtr.write_record(headers)?;
     for rec in sorted_records {
         wtr.write_record(&rec)?;
     }
     wtr.flush()?;
-    debug!("write_sorted_chunk for {:?} finished in: {:?}", chunk_path, t0.elapsed());
+    debug!(
+        "write_sorted_chunk for {:?} finished in: {:?}",
+        chunk_path,
+        t0.elapsed()
+    );
     Ok(())
 }
 
-fn compare_records(a: &StringRecord, b: &StringRecord, sort_indices: &[usize]) -> std::cmp::Ordering {
+fn compare_records(
+    a: &StringRecord,
+    b: &StringRecord,
+    sort_indices: &[usize],
+) -> std::cmp::Ordering {
     for &idx in sort_indices {
         let ord = a.get(idx).cmp(&b.get(idx));
         if ord != std::cmp::Ordering::Equal {
@@ -392,8 +544,14 @@ pub fn parallel_merge_sort(
         return Err(anyhow::anyhow!("No input files provided"));
     }
     let headers = validate_headers(input_paths)?;
-    info!("Validated headers across all input files: {:?}", headers.iter().collect::<Vec<_>>());
-    info!("Starting parallel merge sort for {} files", input_paths.len().to_formatted_string(&Locale::en));
+    info!(
+        "Validated headers across all input files: {:?}",
+        headers.iter().collect::<Vec<_>>()
+    );
+    info!(
+        "Starting parallel merge sort for {} files",
+        input_paths.len().to_formatted_string(&Locale::en)
+    );
     let temp_dir = TempDir::new()?;
     let total_start = Instant::now();
     let split_start = Instant::now();
