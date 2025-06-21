@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
-use log::info;
+use log::{debug, info};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
             sort_by,
             chunk_size,
         } => unsafe {
-            // Set chunk size environment variable for the parallel merge
+            // Set the chunk size as an environment variable
             std::env::set_var("CHUNK_SIZE_MB", chunk_size.to_string());
             let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
             merge_csv_files(&input_files, &output, &sort_columns)
@@ -96,6 +96,9 @@ fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&s
 
     // If no sorting is needed, just concatenate the files
     if sort_columns.is_empty() {
+        debug!("No sorting needed");
+        debug!("Concatenating files: {:?}", input_paths);
+        
         let first_file = File::open(&input_paths[0]).context("Failed to open first input file")?;
         let headers = ReaderBuilder::new()
             .has_headers(true)
@@ -106,6 +109,8 @@ fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&s
         concatenate_files(&input_paths, output_file, &headers)?;
     } else {
         // Use parallel merge sort for large files with sorting
+        debug!("Using parallel merge sort");
+        
         parallel_merge_sort(&input_paths, Path::new(output_file), sort_columns)
             .context("Parallel merge sort failed")?;
     }
@@ -161,7 +166,7 @@ fn split_csv_file(
         input_file, rows_per_file
     );
 
-    // Create output directory if it doesn't exist
+    // Create the output directory
     fs::create_dir_all(output_dir).context("Failed to create output directory")?;
 
     // Create a temporary directory for sorting

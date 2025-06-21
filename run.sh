@@ -2,16 +2,16 @@
 set -euo pipefail
 
 # Increase file descriptor limit if possible
-ulimit -n 4096 2>/dev/null || true
+ulimit -n 8192 2>/dev/null || true
 
 # Configuration
 INPUT_DIR="large_files"
 OUTPUT_DIR="merge_files"
 OUTPUT_FILE="${OUTPUT_DIR}/merged_accounts.csv"
 SORT_BY="account_no"  # Default sort column
-
+RAYON_NUM_THREADS="8"
 # Set log level (can be overridden by environment variable)
-export RUST_LOG=${RUST_LOG:-info}
+export RUST_LOG=${RUST_LOG:-debug}
 
 # Ensure input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
@@ -174,11 +174,17 @@ if [ "$LINE_COUNT" != "unknown" ]; then
     echo "   Total records: ${LINE_COUNT}"
 fi
 
-# Calculate and display processing speed
-if [ $DURATION -gt 0 ] && [ $TOTAL_INPUT_SIZE -gt 0 ]; then
+# Remove problematic arithmetic expansion with possible empty variables
+# Fix DURATION/0 or unset errors
+if [ -n "${DURATION:-}" ] && [ "$DURATION" -gt 0 ] && [ -n "${TOTAL_INPUT_SIZE:-}" ] && [ "$TOTAL_INPUT_SIZE" -gt 0 ]; then
     MB_PER_SEC=$((TOTAL_INPUT_SIZE / DURATION / 1048576))
     echo "   Processing speed: ~${MB_PER_SEC} MB/s"
 fi
 
-echo "   Time taken: ${DURATION} seconds ($(($DURATION / 60))m$(($DURATION % 60))s)"
-echo -e "\n=== Process completed ===\n"
+if [ -n "${DURATION:-}" ] && [ "$DURATION" -ge 0 ]; then
+    MIN=$((DURATION / 60))
+    SEC=$((DURATION % 60))
+    echo "   Time taken: ${DURATION} seconds (${MIN}m${SEC}s)"
+fi
+
+echo -e "\n=== Process completed ==="
