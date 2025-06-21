@@ -266,9 +266,7 @@ fn split_file_to_chunks(
     chunk_size_mb: usize,
     headers: &StringRecord,
 ) -> Result<Vec<PathBuf>> {
-    
-    debug!("Splitting file: {:?}", file_path);
-    debug!("Chunk size: {} MB", chunk_size_mb);
+    debug!("Splitting file: {:?} into chunks of {} MB", file_path, chunk_size_mb);
     
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
@@ -293,6 +291,7 @@ fn split_file_to_chunks(
     }
     if !records.is_empty() {
         let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
+        debug!("Writing last chunk: {:?} with {} records", chunk_path, records.len());
         write_sorted_chunk(&records, &chunk_path, headers, sort_columns)?;
         chunk_paths.push(chunk_path);
     }

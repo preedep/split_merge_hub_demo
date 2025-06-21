@@ -58,8 +58,11 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
+    // เพิ่ม timestamp format
     pretty_env_logger::init();
 
+    
+    
     let cli = Cli::parse();
 
     match cli.command {
@@ -98,7 +101,7 @@ fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&s
     if sort_columns.is_empty() {
         debug!("No sorting needed");
         debug!("Concatenating files: {:?}", input_paths);
-        
+
         let first_file = File::open(&input_paths[0]).context("Failed to open first input file")?;
         let headers = ReaderBuilder::new()
             .has_headers(true)
