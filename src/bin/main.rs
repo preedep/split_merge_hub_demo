@@ -110,7 +110,6 @@ fn merge_csv_files(input_files: &[String], output_file: &str, sort_columns: &[&s
     } else {
         // Use parallel merge sort for large files with sorting
         debug!("Using parallel merge sort");
-        
         parallel_merge_sort(&input_paths, Path::new(output_file), sort_columns)
             .context("Parallel merge sort failed")?;
     }

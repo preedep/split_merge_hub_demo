@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
+use tempfile::TempDir;
 
 // --- MergeRecord struct for heap ---
 #[derive(Debug)]
@@ -257,6 +258,71 @@ pub fn parallel_merge_chunks(
     Ok(())
 }
 
+// --- Split a single input file into sorted chunks in parallel ---
+fn split_file_to_chunks(
+    file_path: &Path,
+    temp_dir: &TempDir,
+    sort_columns: &[&str],
+    chunk_size_mb: usize,
+    headers: &StringRecord,
+) -> Result<Vec<PathBuf>> {
+    
+    debug!("Splitting file: {:?}", file_path);
+    debug!("Chunk size: {} MB", chunk_size_mb);
+    
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(BufReader::new(File::open(file_path)?));
+    let mut records = Vec::new();
+    let mut chunk_paths = Vec::new();
+    let mut chunk_idx = 0;
+    let mut current_size = 0;
+    let chunk_size = chunk_size_mb * 1024 * 1024;
+    for result in rdr.records() {
+        let record = result?;
+        current_size += record.as_slice().len();
+        records.push(record);
+        if current_size >= chunk_size {
+            let mut chunk = records.split_off(0);
+            let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
+            chunk_idx += 1;
+            write_sorted_chunk(&chunk, &chunk_path, headers, sort_columns)?;
+            chunk_paths.push(chunk_path);
+            current_size = 0;
+        }
+    }
+    if !records.is_empty() {
+        let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
+        write_sorted_chunk(&records, &chunk_path, headers, sort_columns)?;
+        chunk_paths.push(chunk_path);
+    }
+    debug!("Created {} chunks for file {:?}", chunk_paths.len(), file_path);
+    Ok(chunk_paths)
+}
+
+fn write_sorted_chunk(records: &[StringRecord], chunk_path: &Path, headers: &StringRecord, sort_columns: &[&str]) -> Result<()> {
+    let mut sorted_records = records.to_vec();
+    let sort_indices = get_sort_column_indices(headers, sort_columns);
+    sorted_records.sort_by(|a, b| compare_records(a, b, &sort_indices));
+    let mut wtr = WriterBuilder::new().has_headers(true).from_path(chunk_path)?;
+    wtr.write_record(headers)?;
+    for rec in sorted_records {
+        wtr.write_record(&rec)?;
+    }
+    wtr.flush()?;
+    Ok(())
+}
+
+fn compare_records(a: &StringRecord, b: &StringRecord, sort_indices: &[usize]) -> std::cmp::Ordering {
+    for &idx in sort_indices {
+        let ord = a.get(idx).cmp(&b.get(idx));
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 // --- Main entry point for CLI/integration ---
 pub fn parallel_merge_sort(
     input_paths: &[PathBuf],
@@ -267,10 +333,19 @@ pub fn parallel_merge_sort(
         return Err(anyhow::anyhow!("No input files provided"));
     }
     let headers = validate_headers(input_paths)?;
-    info!(
-        "Validated headers across all input files: {:?}",
-        headers.iter().collect::<Vec<_>>()
-    );
+    info!("Validated headers across all input files: {:?}", headers.iter().collect::<Vec<_>>());
     info!("Starting parallel merge sort for {} files", input_paths.len());
-    parallel_merge_chunks(input_paths.to_vec(), output_path.as_ref(), sort_columns)
+    let temp_dir = TempDir::new()?;
+    let chunk_size_mb = std::env::var("CHUNK_SIZE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+    debug!("Using chunk size: {} MB", chunk_size_mb);
+    // Split all input files to sorted chunks in parallel
+    let all_chunks: Vec<PathBuf> = input_paths
+        .par_iter()
+        .map(|path| split_file_to_chunks(path, &temp_dir, sort_columns, chunk_size_mb, &headers))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    info!("Created {} sorted chunks", all_chunks.len());
+    parallel_merge_chunks(all_chunks, output_path.as_ref(), sort_columns)
 }
