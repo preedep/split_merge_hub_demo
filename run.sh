@@ -73,11 +73,11 @@ fi
 
 # Check available memory and adjust chunk size if needed
 TOTAL_MEM_MB=$(($(sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1048576))  # Default to 8GB if can't detect
-CHUNK_SIZE_MB=500  # Default chunk size in MB
+CHUNK_SIZE_MB=256  # Default chunk size in MB
 
 # If we have less than 4GB of RAM, use smaller chunks
 if [ "$TOTAL_MEM_MB" -lt 4096 ]; then
-    CHUNK_SIZE_MB=200
+    CHUNK_SIZE_MB=128
 fi
 
 echo "   Detected ${TOTAL_MEM_MB}MB of system memory"

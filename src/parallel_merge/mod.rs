@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+use num_cpus;
 
 // --- MergeRecord struct for heap ---
 #[derive(Debug)]
@@ -272,31 +274,58 @@ fn split_file_to_chunks(
         .has_headers(true)
         .from_reader(BufReader::new(File::open(file_path)?));
     let mut records = Vec::new();
-    let mut chunk_paths = Vec::new();
     let mut chunk_idx = 0;
     let mut current_size = 0;
     let chunk_size = chunk_size_mb * 1024 * 1024;
+    let chunk_paths = Arc::new(Mutex::new(Vec::new()));
+    let max_parallel_chunks = num_cpus::get().max(2); // Use number of logical CPUs, at least 2
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(max_parallel_chunks).build().unwrap();
     for result in rdr.records() {
         let record = result?;
         current_size += record.as_slice().len();
         records.push(record);
         if current_size >= chunk_size {
-            let mut chunk = records.split_off(0);
+            let chunk = std::mem::take(&mut records);
             let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
+            let chunk_paths = Arc::clone(&chunk_paths);
+            let headers = headers.clone();
+            let sort_columns = sort_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            pool.install(|| {
+                let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
+                if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
+                    error!("Chunk write failed: {:?}", e);
+                } else {
+                    let mut paths = chunk_paths.lock().unwrap();
+                    paths.push(chunk_path);
+                }
+            });
             chunk_idx += 1;
-            write_sorted_chunk(&chunk, &chunk_path, headers, sort_columns)?;
-            chunk_paths.push(chunk_path);
             current_size = 0;
         }
     }
     if !records.is_empty() {
         let chunk_path = temp_dir.path().join(format!("chunk_{}_{}.csv", file_path.file_stem().unwrap().to_string_lossy(), chunk_idx));
         debug!("Writing last chunk: {:?} with {} records", chunk_path, records.len());
-        write_sorted_chunk(&records, &chunk_path, headers, sort_columns)?;
-        chunk_paths.push(chunk_path);
+        let chunk_paths = Arc::clone(&chunk_paths);
+        let headers = headers.clone();
+        let sort_columns = sort_columns.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let chunk = std::mem::take(&mut records);
+        pool.install(|| {
+            let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
+                error!("Chunk write failed: {:?}", e);
+            } else {
+                let mut paths = chunk_paths.lock().unwrap();
+                paths.push(chunk_path);
+            }
+        });
     }
-    debug!("Created {} chunks for file {:?}", chunk_paths.len(), file_path);
-    Ok(chunk_paths)
+    let mut paths = Arc::try_unwrap(chunk_paths)
+        .map(|mutex| mutex.into_inner().unwrap())
+        .unwrap_or_else(|arc| arc.lock().unwrap().clone());
+    debug!("Created {} chunks for file {:?}", paths.len(), file_path);
+    paths.sort(); // Ensure deterministic order
+    Ok(paths)
 }
 
 fn write_sorted_chunk(records: &[StringRecord], chunk_path: &Path, headers: &StringRecord, sort_columns: &[&str]) -> Result<()> {

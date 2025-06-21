@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
+use chrono::Local;
 use log::{debug, info};
 use std::fs::{self, File};
 use std::io;
@@ -58,11 +59,35 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // เพิ่ม timestamp format
-    pretty_env_logger::init();
+    // Initialize logger with timestamp
+    unsafe {
+        std::env::set_var(
+            "RUST_LOG_STYLE",
+            "always"
+        );
+    }
+    unsafe {
+        std::env::set_var(
+            "RUST_LOG_FORMAT",
+            "[{time}] {level} {target} > {args}"
+        );
+    }
+    // Use pretty_env_logger with custom format
+    pretty_env_logger::formatted_timed_builder()
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "{} [{}] {} > {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
 
-    
-    
+    // ... rest of the code remains the same ...
     let cli = Cli::parse();
 
     match cli.command {
