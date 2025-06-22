@@ -2,17 +2,15 @@
 use anyhow::{Context, Result};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
 use log::{debug, error, info, warn};
-use num_cpus;
 use num_format::{Locale, ToFormattedString};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tempfile::TempDir;
+use std::collections::BinaryHeap;
 
 // --- MergeRecord struct for heap ---
 #[derive(Debug)]
@@ -43,6 +41,21 @@ impl PartialEq for MergeRecord {
 }
 
 impl Eq for MergeRecord {}
+
+// --- Compare records helper ---
+fn compare_records(
+    a: &StringRecord,
+    b: &StringRecord,
+    sort_indices: &[usize],
+) -> std::cmp::Ordering {
+    for &idx in sort_indices {
+        let ord = a.get(idx).cmp(&b.get(idx));
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
 
 // --- Header validation ---
 fn validate_headers(input_paths: &[PathBuf]) -> Result<StringRecord> {
@@ -128,6 +141,135 @@ fn get_first_record(path: &Path) -> Result<StringRecord> {
     }
 }
 
+// --- Parallel split, sort, write chunks ---
+pub fn parallel_split_file_to_chunks(
+    file_path: &Path,
+    temp_dir: &TempDir,
+    sort_columns: &[&str],
+    chunk_size_mb: usize,
+    headers: &StringRecord,
+) -> Result<Vec<PathBuf>> {
+    use std::io::{BufRead, Seek, SeekFrom};
+    use std::thread;
+    use std::time::Duration;
+    // Start total timer
+    let total_start = Instant::now();
+    let file_size = std::fs::metadata(file_path)?.len();
+    let chunk_size = chunk_size_mb as u64 * 1024 * 1024;
+    let mut chunk_offsets = vec![0u64];
+    let mut f = File::open(file_path)?;
+    let mut reader = BufReader::new(&f);
+    let mut pos = 0u64;
+    let mut buf = String::new();
+    let prescan_start = Instant::now();
+    // Find chunk boundaries by byte offset (approximate, align to line)
+    while pos < file_size {
+        let target = (pos + chunk_size).min(file_size);
+        let mut bytes = 0;
+        while pos + bytes < target {
+            let read = reader.read_line(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            bytes += read as u64;
+            buf.clear();
+        }
+        pos += bytes;
+        chunk_offsets.push(pos);
+    }
+    if *chunk_offsets.last().unwrap() < file_size {
+        chunk_offsets.push(file_size);
+    }
+    let prescan_elapsed = prescan_start.elapsed();
+    info!(
+        "[split] Pre-scan complete. File: {:?}, Size: {} bytes, Chunks: {}, ChunkSize: {} MB, Pre-scan Time: {:.2?}",
+        file_path,
+        file_size,
+        chunk_offsets.len() - 1,
+        chunk_size_mb,
+        prescan_elapsed
+    );
+    info!(
+        "[split] Processing {} chunks in parallel...",
+        (chunk_offsets.len() - 1)
+    );
+    let chunk_timer = Instant::now();
+    let chunk_paths: Result<Vec<PathBuf>> = chunk_offsets.windows(2).enumerate().par_bridge().map(|(i, window)| -> Result<PathBuf> {
+        let chunk_start_time = Instant::now();
+        let start = window[0];
+        let end = window[1];
+        let mut f = File::open(file_path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut reader = BufReader::new(f);
+        let mut records = Vec::new();
+        let mut line = String::new();
+        let mut pos = start;
+        // Skip header if not first chunk
+        if i > 0 {
+            reader.read_line(&mut line)?;
+            line.clear();
+        }
+        while pos < end {
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            if !line.trim().is_empty() {
+                let mut csv_reader = csv::ReaderBuilder::new()
+                    .has_headers(false)
+                    .from_reader(line.as_bytes());
+                if let Some(Ok(record)) = csv_reader.records().next() {
+                    records.push(record);
+                }
+            }
+            pos += read as u64;
+            line.clear();
+        }
+        let sort_indices = get_sort_column_indices(headers, sort_columns);
+        let sort_start = Instant::now();
+        records.sort_by(|a, b| compare_records(a, b, &sort_indices));
+        let sort_elapsed = sort_start.elapsed();
+        let chunk_path = temp_dir.path().join(format!("chunk_parallel_{}.csv", i));
+        let write_start = Instant::now();
+        let mut wtr = WriterBuilder::new().has_headers(true).from_path(&chunk_path)?;
+        wtr.write_record(headers)?;
+        for rec in &records {
+            wtr.write_record(rec)?;
+        }
+        wtr.flush()?;
+        let write_elapsed = write_start.elapsed();
+        let chunk_elapsed = chunk_start_time.elapsed();
+        info!(
+            "[split] Chunk {}/{} | Bytes: {}-{} | Records: {} | Path: {:?} | Read+Parse+Sort: {:.2?} | Write: {:.2?} | Total: {:.2?}",
+            i + 1,
+            chunk_offsets.len() - 1,
+            start,
+            end,
+            records.len(),
+            chunk_path,
+            sort_elapsed,
+            write_elapsed,
+            chunk_elapsed
+        );
+        Ok(chunk_path)
+    }).collect();
+    let chunk_total_elapsed = chunk_timer.elapsed();
+    let chunk_count = match &chunk_paths {
+        Ok(paths) => paths.len(),
+        Err(_) => 0
+    };
+    info!(
+        "[split] ALL DONE. File: {:?}, Size: {} bytes, Chunks: {}, Time: {:.2?}",
+        file_path,
+        file_size,
+        chunk_count,
+        chunk_total_elapsed
+    );
+    debug!("[split] Total elapsed (including pre-scan): {:.2?}", total_start.elapsed());
+    chunk_paths
+}
+
+// --- Merge/Sort helpers ---
 /// Merges multiple CSV chunk files into a single sorted CSV file.
 ///
 /// # Arguments
@@ -212,6 +354,7 @@ pub fn merge_chunks(
         output_path
     );
     // Read headers from first chunk
+    debug!("Reading headers from first chunk");
     let (headers, has_headers) = {
         let first_record = get_first_record(&chunk_files[0])?;
         let looks_like_headers = first_record.iter().all(|field| {
@@ -228,6 +371,7 @@ pub fn merge_chunks(
         }
     };
     // Validate all chunks have matching headers if headers exist
+    debug!("Validating headers");
     if has_headers {
         for (i, chunk_path) in chunk_files.iter().enumerate().skip(1) {
             let record = get_first_record(chunk_path)?;
@@ -328,20 +472,6 @@ pub fn merge_chunks(
     Ok(())
 }
 
-// --- Parallel merge tree for chunk files ---
-fn merge_two_chunks(
-    chunk_a: &PathBuf,
-    chunk_b: &PathBuf,
-    output_path: &Path,
-    sort_columns: &[&str],
-) -> Result<()> {
-    merge_chunks(
-        &vec![chunk_a.clone(), chunk_b.clone()],
-        output_path,
-        sort_columns,
-    )
-}
-
 /// Merges multiple sorted chunk files into a single sorted output file in parallel using a k-way merge approach.
 ///
 /// # Arguments
@@ -380,7 +510,10 @@ fn merge_two_chunks(
 /// * Logs the number of chunk files and `k` value at the start of the merge.
 /// * Logs file deletions and any errors encountered while deleting temporary files.
 ///
-
+/// # Debugging
+///
+/// * The function logs the time taken to perform the merging operation when debug mode is enabled.
+///
 pub fn parallel_merge_chunks(
     mut chunk_files: Vec<PathBuf>,
     output_path: &Path,
@@ -449,465 +582,6 @@ pub fn parallel_merge_chunks(
     Ok(())
 }
 
-/// Splits a large CSV file into smaller, sorted chunks with a specified size.
-///
-/// # Arguments
-/// - `file_path` - A reference to the path of the input CSV file to be split.
-/// - `temp_dir` - A reference to a temporary directory path where the chunk files will be stored.
-/// - `sort_columns` - A slice of string references representing the column names to sort each chunk by.
-/// - `chunk_size_mb` - The size of each chunk in megabytes (MB).
-/// - `headers` - A reference to the CSV headers (`StringRecord`) to include in each generated chunk.
-///
-/// # Returns
-/// A `Result` containing:
-/// - On success: A vector of `PathBuf` objects, each representing the path to a generated chunk file.
-/// - On failure: An error of type `std::io::Error` or other possible errors encountered during file operations.
-///
-/// # Functionality
-/// 1. The function reads the input CSV file in chunks, each of size approximately `chunk_size_mb` MB.
-/// 2. Each chunk is then sorted based on the columns specified in `sort_columns`.
-/// 3. The sorted data is written to separate chunk files in the given `temp_dir`.
-/// 4. If the number of chunks exceeds the available logical CPUs, the function uses a Rayon thread
-///    pool for parallel processing to optimize chunk generation.
-/// 5. At the end of processing, the function ensures all chunk paths are sorted deterministically
-///    before returning the paths.
-///
-/// # Logging
-/// - Logs the beginning and end of the process, including the input file, chunk sizes, and total chunks generated.
-/// - Logs progress for each chunk, including its size and output path.
-/// - Logs any errors encountered while writing individual chunk files.
-///
-/// # Errors
-/// - Returns an error if the input file cannot be opened or read.
-/// - Returns an error if writing a chunk to the `temp_dir` fails.
-/// - Captures and logs errors during chunk writing or sorting.
-///
-/// # Example
-/// ```rust
-/// use tempfile::TempDir;
-/// use csv::StringRecord;
-/// use std::path::PathBuf;
-///
-/// let temp_dir = TempDir::new().expect("Failed to create temporary directory");
-/// let file_path = PathBuf::from("input.csv");
-/// let sort_columns = vec!["column1", "column2"];
-/// let chunk_size_mb = 10; // 10 MB per chunk
-/// let headers = StringRecord::from(vec!["column1", "column2", "column3"]);
-///
-/// let chunk_paths = split_file_to_chunks(
-///     &file_path,
-///     &temp_dir,
-///     &sort_columns,
-///     chunk_size_mb,
-///     &headers,
-/// ).expect("Failed to split file");
-///
-/// println!("Generated {} chunks.", chunk_paths.len());
-/// ```
-///
-/// # Internal Parallelism
-/// - The function uses a Rayon thread pool with the number of threads matching the system's logical CPU count.
-/// - Parallelism ensures that writing and sorting large chunks is efficient without blocking the main thread.
-///
-/// # Notes
-/// - The function assumes the input CSV file has a valid structure and contains proper headers.
-/// - The temporary file paths are managed by `temp_dir`, and these files are typically deleted when the
-///   `TempDir` instance is dropped, ensuring temporary storage is cleaned up after use.
-fn split_file_to_chunks(
-    file_path: &Path,
-    temp_dir: &TempDir,
-    sort_columns: &[&str],
-    chunk_size_mb: usize,
-    headers: &StringRecord,
-) -> Result<Vec<PathBuf>> {
-    let t0 = Instant::now();
-    debug!(
-        "Splitting file: {:?} into chunks of {} MB",
-        file_path, chunk_size_mb
-    );
-
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true)
-        .from_reader(BufReader::new(File::open(file_path)?));
-    let mut records = Vec::new();
-    let mut chunk_idx = 0;
-    let mut current_size = 0;
-    let chunk_size = chunk_size_mb * 1024 * 1024;
-    let chunk_paths = Arc::new(Mutex::new(Vec::new()));
-    let max_parallel_chunks = num_cpus::get().max(2); // Use number of logical CPUs, at least 2
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(max_parallel_chunks)
-        .build()
-        .unwrap();
-    for result in rdr.records() {
-        let record = result?;
-        current_size += record.as_slice().len();
-        records.push(record);
-        if current_size >= chunk_size {
-            let chunk = std::mem::take(&mut records);
-            let chunk_path = temp_dir.path().join(format!(
-                "chunk_{}_{}.csv",
-                file_path.file_stem().unwrap().to_string_lossy(),
-                chunk_idx
-            ));
-            let chunk_paths = Arc::clone(&chunk_paths);
-            let headers = headers.clone();
-            let sort_columns = sort_columns
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            pool.install(|| {
-                debug!(
-                    "Writing chunk: {:?} with {} records",
-                    chunk_path,
-                    chunk.len().to_formatted_string(&Locale::en)
-                );
-                let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref)
-                {
-                    error!("Chunk write failed: {:?}", e);
-                } else {
-                    let mut paths = chunk_paths.lock().unwrap();
-                    paths.push(chunk_path);
-                }
-            });
-            chunk_idx += 1;
-            current_size = 0;
-        }
-    }
-    if !records.is_empty() {
-        let chunk_path = temp_dir.path().join(format!(
-            "chunk_{}_{}.csv",
-            file_path.file_stem().unwrap().to_string_lossy(),
-            chunk_idx
-        ));
-        debug!(
-            "Writing last chunk: {:?} with {} records",
-            chunk_path,
-            records.len().to_formatted_string(&Locale::en)
-        );
-        let chunk_paths = Arc::clone(&chunk_paths);
-        let headers = headers.clone();
-        let sort_columns = sort_columns
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        let chunk = std::mem::take(&mut records);
-        pool.install(|| {
-            debug!(
-                "Writing chunk: {:?} with {} records",
-                chunk_path,
-                chunk.len().to_formatted_string(&Locale::en)
-            );
-            let sort_columns_ref: Vec<&str> = sort_columns.iter().map(|s| s.as_str()).collect();
-            if let Err(e) = write_sorted_chunk(&chunk, &chunk_path, &headers, &sort_columns_ref) {
-                error!("Chunk write failed: {:?}", e);
-            } else {
-                let mut paths = chunk_paths.lock().unwrap();
-                paths.push(chunk_path);
-            }
-        });
-    }
-    let mut paths = Arc::try_unwrap(chunk_paths)
-        .map(|mutex| mutex.into_inner().unwrap())
-        .unwrap_or_else(|arc| arc.lock().unwrap().clone());
-    debug!(
-        "Created {} chunks for file {:?}",
-        paths.len().to_formatted_string(&Locale::en),
-        file_path
-    );
-    debug!(
-        "split_file_to_chunks for {:?} finished in: {:?}",
-        file_path,
-        t0.elapsed()
-    );
-    paths.sort(); // Ensure deterministic order
-    Ok(paths)
-}
-
-/**
- * Splits a large CSV file into smaller sorted chunks in parallel, based on specified criteria.
- *
- * # Arguments
- *
- * - `file_path` (`&Path`): Path to the input CSV file that needs to be split into chunks.
- * - `temp_dir` (`&TempDir`): A temporary directory used to store the resulting chunk files.
- * - `sort_columns` (`&[&str]`): List of column names used to determine the sorting order of records within each chunk.
- * - `chunk_size_mb` (`usize`): Maximum size of each chunk (in megabytes).
- * - `headers` (`&StringRecord`): Header row of the CSV file containing column names. It is expected to match the headers in the input file for consistent sorting.
- *
- * # Returns
- *
- * `Result<Vec<PathBuf>>`:
- * - On success, returns a vector of file paths pointing to the generated sorted chunk files.
- * - On failure, returns an error explaining what went wrong during file processing, reading, or writing.
- *
- * # Process Overview
- *
- * 1. **Determine Chunk Boundaries**:
- *    - Using the specified `chunk_size_mb`, the file's size is divided into approximate chunks.
- *    - Ensures chunk boundaries align with line breaks to make each chunk self-contained.
- *
- * 2. **Pre-Processing**:
- *    - Reads the header line from the input file (assumes the header is a single line).
- *    - Determines starting offsets of each chunk by scanning for line breaks within the file.
- *
- * 3. **Parallel Processing**:
- *    - For each chunk, processes the data within the defined range (between its start and end offsets).
- *    - Each chunk is handled in parallel using the Rayon library for improved efficiency.
- *    
- * 4. **Sorting**:
- *    - Each chunk is loaded into memory, and its records are parsed and sorted using the specified `sort_columns`.
- *    - Sorting relies on helper functions (`get_sort_column_indices` and `compare_records`).
- *
- * 5. **Writing Sorted Chunks**:
- *    - After sorting, each chunk is written to a new file in the temporary directory.
- *    - Each output file includes the header row.
- *
- * # External Library Dependencies
- *
- * - `csv`: Used for safely parsing and writing CSV data.
- * - `rayon`: Enables parallelism when processing chunks.
- *
- * # Errors
- *
- * This function may return an error in the following scenarios:
- * - Issues with file I/O operations, such as reading the input file or writing the chunk files.
- * - Malformed CSV data or record parsing failures.
- * - Sorting or header mismatch issues if `sort_columns` doesn't align with the file's structure.
- *
- * # Notes
- *
- * - Parallel processing improves performance, but memory and disk usage should be monitored when working with large files and large numbers of chunks.
- * - All temporary chunk files are saved in the directory provided by `temp_dir`.
- * - The header for each chunk is copied from the input file's `headers` argument.
- */
-pub fn parallel_split_file_to_chunks(
-    file_path: &Path,
-    temp_dir: &TempDir,
-    sort_columns: &[&str],
-    chunk_size_mb: usize,
-    headers: &StringRecord,
-) -> Result<Vec<PathBuf>> {
-    use std::io::{BufRead, Seek, SeekFrom};
-    use rayon::prelude::*;
-    
-
-    let t0 = Instant::now();
-    debug!(
-        "Parallel Splitting file: {:?} into chunks of {} MB",
-        file_path, chunk_size_mb
-    );
-
-    let file_size = std::fs::metadata(file_path)?.len();
-    let chunk_size = (chunk_size_mb as u64) * 1024 * 1024;
-    let mut chunk_offsets = vec![0u64];
-    let mut cur_offset = 0u64;
-    let mut file = File::open(file_path)?;
-    // Read header (assume single line)
-    let mut header_line = String::new();
-    let mut reader = BufReader::new(&file);
-    let header_bytes = reader.read_line(&mut header_line)?;
-    cur_offset += header_bytes as u64;
-    // Pre-scan to find chunk boundaries (at line start)
-    while cur_offset < file_size {
-        let mut f = File::open(file_path)?;
-        if cur_offset + chunk_size >= file_size {
-            chunk_offsets.push(file_size);
-            break;
-        }
-        f.seek(SeekFrom::Start(cur_offset + chunk_size))?;
-        let mut buf_reader = BufReader::new(f);
-        let mut dummy = String::new();
-        let bytes = buf_reader.read_line(&mut dummy)?;
-        cur_offset = cur_offset + chunk_size + bytes as u64;
-        if cur_offset < file_size {
-            chunk_offsets.push(cur_offset);
-        } else {
-            chunk_offsets.push(file_size);
-            break;
-        }
-    }
-    let elapsed = t0.elapsed();
-    debug!(
-        "Pre-scan complete. File: {:?}, Size: {} bytes, Chunks: {}, Time: {:.2?}",
-        file_path,
-        file_size,
-        chunk_offsets.len() - 1,
-        elapsed
-    );
-    
-    // Parallel read, sort, write for each chunk
-    let chunk_paths: Result<Vec<PathBuf>> = chunk_offsets.windows(2).enumerate().par_bridge().map(|(i, window)| {
-        let start = window[0];
-        let end = window[1];
-        let mut f = File::open(file_path)?;
-        f.seek(SeekFrom::Start(start))?;
-        let mut buf_reader = BufReader::new(f);
-        let mut records = Vec::new();
-        let mut line = String::new();
-        // ถ้าไม่ใช่ chunk แรก ให้ข้าม header
-        let t0 = Instant::now();
-        if i > 0 {
-            line.clear();
-            buf_reader.read_line(&mut line)?;
-        }
-        let mut pos = start + if i > 0 { line.len() as u64 } else { 0 };
-        while pos < end {
-            line.clear();
-            let bytes = buf_reader.read_line(&mut line)?;
-            if bytes == 0 { break; }
-            // Parse CSV record using csv crate for safety
-            let mut csv_reader = csv::ReaderBuilder::new()
-                .has_headers(false)
-                .from_reader(line.as_bytes());
-            if let Some(Ok(record)) = csv_reader.records().next() {
-                if !record.is_empty() {
-                    records.push(record);
-                }
-            }
-            pos += bytes as u64;
-        }
-        // Sort records
-        let sort_indices = get_sort_column_indices(headers, sort_columns);
-        records.sort_by(|a, b| compare_records(a, b, &sort_indices));
-        // Write chunk
-        let chunk_path = temp_dir.path().join(format!("chunk_parallel_{}.csv", i));
-        let mut wtr = WriterBuilder::new().has_headers(true).from_path(&chunk_path)?;
-        wtr.write_record(headers)?;
-        for rec in &records {
-            wtr.write_record(rec)?;
-        }
-        let elapsed = t0.elapsed();
-        debug!(
-            "Wrote chunk {}: {:?} with {} records in {:.2?}",
-            i,
-            chunk_path,
-            records.len().to_formatted_string(&Locale::en),
-            elapsed
-        );
-        wtr.flush()?;
-        Ok(chunk_path)
-    }).collect();
-    
-    let elapsed = t0.elapsed();
-    let chunk_count = match &chunk_paths {
-        Ok(paths) => paths.len(),
-        Err(_) => 0
-    };
-    info!(
-        "parallel_split_file_to_chunks: Done. File: {:?}, Size: {} bytes, Chunks: {}, Time: {:.2?}",
-        file_path,
-        file_size.to_formatted_string(&Locale::en),
-        chunk_count.to_formatted_string(&Locale::en),
-        elapsed
-    );
-    chunk_paths
-}
-
-/// Writes a sorted chunk of CSV records to the specified file path.
-///
-/// This function takes a slice of `StringRecord` values, sorts them based on
-/// the specified columns, and writes the sorted records to the given file.
-/// The resulting file will also include the headers at the top.
-///
-/// # Arguments
-///
-/// * `records` - A slice of `StringRecord` representing the records to sort and write.
-/// * `chunk_path` - A reference to a `Path` representing the file path where
-///   the sorted chunk will be written.
-/// * `headers` - A reference to a `StringRecord` representing the headers for
-///   the CSV file (written at the top of the file).
-/// * `sort_columns` - A slice of string slices representing the names of the
-///   columns to sort the records by.
-///
-/// # Returns
-///
-/// Returns `Ok(())` if the chunk was successfully sorted and written to the specified
-/// file. Otherwise, it returns a `Result` with an error indicating what went wrong.
-///
-/// # Errors
-///
-/// This function will return an error if:
-/// * The specified `chunk_path` cannot be created or written to.
-/// * Sorting or writing the records fails for any reason.
-/// * Flushing the writer to the file fails.
-///
-/// # Performance
-///
-/// The function reports the time it takes to sort the records and write the chunk to
-/// the log in debug mode. The sorting operation uses the `compare_records` function
-/// and is based on indices of the `sort_columns`.
-///
-/// # Example
-///
-/// ```rust
-/// use csv::{StringRecord, WriterBuilder};
-/// use std::path::Path;
-/// use std::time::Instant;
-///
-/// let records = vec![
-///     StringRecord::from(vec!["B", "2"]),
-///     StringRecord::from(vec!["A", "1"]),
-/// ];
-/// let headers = StringRecord::from(vec!["Col1", "Col2"]);
-/// let sort_columns = vec!["Col1"];
-/// let chunk_path = Path::new("sorted_chunk.csv");
-///
-/// write_sorted_chunk(&records, &chunk_path, &headers, &sort_columns).unwrap();
-/// ```
-///
-/// This example writes a `sorted_chunk.csv` file with the following content:
-/// ```csv
-/// Col1,Col2
-/// A,1
-/// B,2
-/// ```
-///
-/// # Debugging
-///
-/// Logs the duration of the sorting and writing step in debug mode using `debug!`.
-fn write_sorted_chunk(
-    records: &[StringRecord],
-    chunk_path: &Path,
-    headers: &StringRecord,
-    sort_columns: &[&str],
-) -> Result<()> {
-    let t0 = Instant::now();
-    let mut sorted_records = records.to_vec();
-    let sort_indices = get_sort_column_indices(headers, sort_columns);
-    sorted_records.sort_by(|a, b| compare_records(a, b, &sort_indices));
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(chunk_path)?;
-    wtr.write_record(headers)?;
-    for rec in sorted_records {
-        wtr.write_record(&rec)?;
-    }
-    wtr.flush()?;
-    debug!(
-        "write_sorted_chunk for {:?} finished in: {:?}",
-        chunk_path,
-        t0.elapsed()
-    );
-    Ok(())
-}
-
-fn compare_records(
-    a: &StringRecord,
-    b: &StringRecord,
-    sort_indices: &[usize],
-) -> std::cmp::Ordering {
-    for &idx in sort_indices {
-        let ord = a.get(idx).cmp(&b.get(idx));
-        if ord != std::cmp::Ordering::Equal {
-            return ord;
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-///
 /// Performs a parallel merge sort on multiple input files, producing a single sorted output file.
 ///
 /// # Arguments
@@ -953,6 +627,20 @@ fn compare_records(
 ///     Ok(())
 /// }
 /// ```
+///
+/// # Internal Parallelism
+/// - The function uses a Rayon thread pool with the number of threads matching the system's logical CPU count.
+/// - Parallelism ensures that writing and sorting large chunks is efficient without blocking the main thread.
+///
+/// # Logging
+/// - The function emits debug logs to provide insights into the merge process:
+///   - Logs the start and end of the merging process, including elapsed time.
+///   - Logs the number of chunk files and `k` value at the start of the merge.
+///   - Logs file deletions and any errors encountered while deleting temporary files.
+///
+/// # Debugging
+/// - The function logs the time taken to perform the merging operation when debug mode is enabled.
+///
 pub fn parallel_merge_sort(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
