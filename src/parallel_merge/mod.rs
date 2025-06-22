@@ -691,6 +691,13 @@ pub fn parallel_split_file_to_chunks(
 ) -> Result<Vec<PathBuf>> {
     use std::io::{BufRead, Seek, SeekFrom};
     use rayon::prelude::*;
+    
+
+    let t0 = Instant::now();
+    debug!(
+        "Parallel Splitting file: {:?} into chunks of {} MB",
+        file_path, chunk_size_mb
+    );
 
     let file_size = std::fs::metadata(file_path)?.len();
     let chunk_size = (chunk_size_mb as u64) * 1024 * 1024;
@@ -721,7 +728,15 @@ pub fn parallel_split_file_to_chunks(
             break;
         }
     }
-
+    let elapsed = t0.elapsed();
+    debug!(
+        "Pre-scan complete. File: {:?}, Size: {} bytes, Chunks: {}, Time: {:.2?}",
+        file_path,
+        file_size,
+        chunk_offsets.len() - 1,
+        elapsed
+    );
+    
     // Parallel read, sort, write for each chunk
     let chunk_paths: Result<Vec<PathBuf>> = chunk_offsets.windows(2).enumerate().par_bridge().map(|(i, window)| {
         let start = window[0];
@@ -732,6 +747,7 @@ pub fn parallel_split_file_to_chunks(
         let mut records = Vec::new();
         let mut line = String::new();
         // ถ้าไม่ใช่ chunk แรก ให้ข้าม header
+        let t0 = Instant::now();
         if i > 0 {
             line.clear();
             buf_reader.read_line(&mut line)?;
@@ -762,12 +778,95 @@ pub fn parallel_split_file_to_chunks(
         for rec in &records {
             wtr.write_record(rec)?;
         }
+        let elapsed = t0.elapsed();
+        debug!(
+            "Wrote chunk {}: {:?} with {} records in {:.2?}",
+            i,
+            chunk_path,
+            records.len().to_formatted_string(&Locale::en),
+            elapsed
+        );
         wtr.flush()?;
         Ok(chunk_path)
     }).collect();
+    
+    let elapsed = t0.elapsed();
+    let chunk_count = match &chunk_paths {
+        Ok(paths) => paths.len(),
+        Err(_) => 0
+    };
+    info!(
+        "parallel_split_file_to_chunks: Done. File: {:?}, Size: {} bytes, Chunks: {}, Time: {:.2?}",
+        file_path,
+        file_size.to_formatted_string(&Locale::en),
+        chunk_count.to_formatted_string(&Locale::en),
+        elapsed
+    );
     chunk_paths
 }
 
+/// Writes a sorted chunk of CSV records to the specified file path.
+///
+/// This function takes a slice of `StringRecord` values, sorts them based on
+/// the specified columns, and writes the sorted records to the given file.
+/// The resulting file will also include the headers at the top.
+///
+/// # Arguments
+///
+/// * `records` - A slice of `StringRecord` representing the records to sort and write.
+/// * `chunk_path` - A reference to a `Path` representing the file path where
+///   the sorted chunk will be written.
+/// * `headers` - A reference to a `StringRecord` representing the headers for
+///   the CSV file (written at the top of the file).
+/// * `sort_columns` - A slice of string slices representing the names of the
+///   columns to sort the records by.
+///
+/// # Returns
+///
+/// Returns `Ok(())` if the chunk was successfully sorted and written to the specified
+/// file. Otherwise, it returns a `Result` with an error indicating what went wrong.
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// * The specified `chunk_path` cannot be created or written to.
+/// * Sorting or writing the records fails for any reason.
+/// * Flushing the writer to the file fails.
+///
+/// # Performance
+///
+/// The function reports the time it takes to sort the records and write the chunk to
+/// the log in debug mode. The sorting operation uses the `compare_records` function
+/// and is based on indices of the `sort_columns`.
+///
+/// # Example
+///
+/// ```rust
+/// use csv::{StringRecord, WriterBuilder};
+/// use std::path::Path;
+/// use std::time::Instant;
+///
+/// let records = vec![
+///     StringRecord::from(vec!["B", "2"]),
+///     StringRecord::from(vec!["A", "1"]),
+/// ];
+/// let headers = StringRecord::from(vec!["Col1", "Col2"]);
+/// let sort_columns = vec!["Col1"];
+/// let chunk_path = Path::new("sorted_chunk.csv");
+///
+/// write_sorted_chunk(&records, &chunk_path, &headers, &sort_columns).unwrap();
+/// ```
+///
+/// This example writes a `sorted_chunk.csv` file with the following content:
+/// ```csv
+/// Col1,Col2
+/// A,1
+/// B,2
+/// ```
+///
+/// # Debugging
+///
+/// Logs the duration of the sorting and writing step in debug mode using `debug!`.
 fn write_sorted_chunk(
     records: &[StringRecord],
     chunk_path: &Path,
@@ -880,7 +979,7 @@ pub fn parallel_merge_sort(
         .unwrap_or(256);
     let all_chunks: Vec<PathBuf> = input_paths
         .par_iter()
-        .map(|path| split_file_to_chunks(path, &temp_dir, sort_columns, chunk_size_mb, &headers))
+        .map(|path| parallel_split_file_to_chunks(path, &temp_dir, sort_columns, chunk_size_mb, &headers))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
