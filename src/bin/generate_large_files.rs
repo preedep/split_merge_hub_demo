@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use humansize::{format_size, DECIMAL};
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use rayon::prelude::*;
 use std::env;
 use std::fs::File;
@@ -14,7 +14,9 @@ fn main() -> Result<()> {
         eprintln!("Usage: {} <rows_per_file>", args[0]);
         std::process::exit(1);
     }
-    let rows_per_file: usize = args[1].parse().expect("Please provide a valid number for rows_per_file");
+    let rows_per_file: usize = args[1]
+        .parse()
+        .expect("Please provide a valid number for rows_per_file");
 
     println!(
         "🚀 Starting to generate 2 large CSV files ({} rows each)",
@@ -68,7 +70,12 @@ fn generate_large_csv(file_path: &str, rows: usize, _start_account_no: usize) ->
         let batch_lines: Vec<String> = batch_indices
             .par_iter()
             .map(|&account_no| {
-                format!("{},{},{}", account_no, format!("FirstName{}", account_no), format!("LastName{}", account_no))
+                format!(
+                    "{},{},{}",
+                    account_no,
+                    format!("FirstName{}", account_no),
+                    format!("LastName{}", account_no)
+                )
             })
             .collect();
         let batch_str = batch_lines.join("\n");
