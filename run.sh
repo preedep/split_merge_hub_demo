@@ -78,11 +78,17 @@ fi
 
 # Check available memory and adjust chunk size if needed
 TOTAL_MEM_MB=$(($(sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1048576))  # Default to 8GB if can't detect
-CHUNK_SIZE_MB=4096  # Default chunk size in MB (4GB)
 
-# If we have less than 8GB of RAM, use smaller chunks
+# Set default chunk size
+CHUNK_SIZE_MB=256
+
+# Adjust chunk size based on total RAM
 if [ "$TOTAL_MEM_MB" -lt 8192 ]; then
-    CHUNK_SIZE_MB=256
+    CHUNK_SIZE_MB=128
+elif [ "$TOTAL_MEM_MB" -ge 32768 ]; then
+    CHUNK_SIZE_MB=2048
+elif [ "$TOTAL_MEM_MB" -ge 16384 ]; then
+    CHUNK_SIZE_MB=1024
 fi
 
 echo "   Detected ${TOTAL_MEM_MB}MB of system memory"
@@ -168,7 +174,7 @@ echo "   Output file: ${OUTPUT_FILE}"
 
 if [ "$FILE_SIZE" != "unknown" ]; then
     echo "   File size: ${FILE_SIZE}"
-    
+
     # Check if output file was created and has content
     if [ ! -s "$OUTPUT_FILE" ]; then
         echo "⚠️  Warning: Output file is empty"

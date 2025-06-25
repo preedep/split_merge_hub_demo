@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use humansize::{format_size, DECIMAL};
 use rand::Rng;
+use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use std::env;
 use std::fs::File;
@@ -44,7 +45,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn generate_large_csv(file_path: &str, rows: usize, start_account_no: usize) -> Result<()> {
+fn generate_large_csv(file_path: &str, rows: usize, _start_account_no: usize) -> Result<()> {
     println!("\n📝 Generating: {} ({} rows)", file_path, rows);
 
     let start_time = Instant::now();
@@ -55,44 +56,29 @@ fn generate_large_csv(file_path: &str, rows: usize, start_account_no: usize) -> 
     writer.write_all(b"account_no,first_name,last_name\n")?;
 
     let batch_size = 200_000;
-    // เปลี่ยนจาก (0..rows) เป็น (1..=rows) เพื่อให้ครบทุก row
-    let indices: Vec<usize> = (1..=rows).collect();
-    let mut records_written = 0;
+    // สุ่ม account_no ไม่เรียงและไม่ซ้ำ
+    let mut account_nos: Vec<usize> = (1..=rows * 10).collect();
+    let mut rng = rand::thread_rng();
+    account_nos.shuffle(&mut rng);
+    let picked: Vec<usize> = account_nos.into_iter().take(rows).collect();
 
-    for (batch_i, batch_indices) in indices.chunks(batch_size).enumerate() {
+    let mut records_written = 0;
+    for batch_indices in picked.chunks(batch_size) {
         // Generate CSV lines in parallel as a Vec<String> แล้ว join แบบไม่มี newline เกิน
         let batch_lines: Vec<String> = batch_indices
             .par_iter()
-            .map(|&i| {
-                let account_no = start_account_no + i - 1;
+            .map(|&account_no| {
                 format!("{},{},{}", account_no, format!("FirstName{}", account_no), format!("LastName{}", account_no))
             })
             .collect();
-        let batch_csv = batch_lines.join("\n");
-        writer.write_all(batch_csv.as_bytes())?;
-        // เพิ่ม newline เฉพาะถ้าไม่ใช่ batch สุดท้าย
-        if (batch_i + 1) * batch_size < rows {
-            writer.write_all(b"\n")?;
-        }
-        records_written += batch_indices.len();
-        let elapsed = start_time.elapsed().as_secs();
-        let speed = records_written as f64 / (elapsed.max(1) as f64);
-        println!(
-            "   - {} records written ({} rec/sec)",
-            records_written, speed as usize
-        );
+        let batch_str = batch_lines.join("\n");
+        writer.write_all(batch_str.as_bytes())?;
+        writer.write_all(b"\n")?;
+        records_written += batch_lines.len();
     }
     writer.flush()?;
-
-    let duration = start_time.elapsed();
-    let file_size = std::fs::metadata(file_path)?.len();
-    println!(
-        "   Done in {:.2}s | {} rows | {}",
-        duration.as_secs_f64(),
-        rows,
-        format_size(file_size, DECIMAL)
-    );
-
+    let elapsed = start_time.elapsed();
+    println!("   -> Done: {} rows in {:.2?}", records_written, elapsed);
     Ok(())
 }
 
