@@ -1,16 +1,23 @@
 use anyhow::{Context, Result};
-use csv::Writer;
 use humansize::{format_size, DECIMAL};
 use rand::Rng;
+use rayon::prelude::*;
+use std::env;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-const TARGET_SIZE_GB: u64 = 5;
-const RECORDS_PER_BATCH: usize = 10_000;
-
 fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <rows_per_file>", args[0]);
+        std::process::exit(1);
+    }
+    let rows_per_file: usize = args[1].parse().expect("Please provide a valid number for rows_per_file");
+
     println!(
-        "🚀 Starting to generate 2 large CSV files ({}GB each)",
-        TARGET_SIZE_GB
+        "🚀 Starting to generate 2 large CSV files ({} rows each)",
+        rows_per_file
     );
 
     // Create output directory
@@ -19,12 +26,12 @@ fn main() -> Result<()> {
 
     // Generate first file
     let file1 = format!("{}/accounts_1.csv", output_dir);
-    generate_large_csv(&file1, TARGET_SIZE_GB)
+    generate_large_csv(&file1, rows_per_file, 1)
         .with_context(|| format!("Failed to generate {}", file1))?;
 
     // Generate second file
     let file2 = format!("{}/accounts_2.csv", output_dir);
-    generate_large_csv(&file2, TARGET_SIZE_GB)
+    generate_large_csv(&file2, rows_per_file, rows_per_file + 1)
         .with_context(|| format!("Failed to generate {}", file2))?;
 
     println!(
@@ -37,133 +44,56 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn generate_large_csv(file_path: &str, target_size_gb: u64) -> Result<()> {
-    println!("\n📝 Generating: {}", file_path);
+fn generate_large_csv(file_path: &str, rows: usize, start_account_no: usize) -> Result<()> {
+    println!("\n📝 Generating: {} ({} rows)", file_path, rows);
 
     let start_time = Instant::now();
-    let target_bytes = target_size_gb * 1024 * 1024 * 1024;
-    let mut writer = Writer::from_path(file_path).context("Failed to create CSV writer")?;
+    let file = File::create(file_path)?;
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file); // 16MB buffer
 
     // Write header
-    writer.write_record(&["account_no", "first_name", "last_name"])?;
+    writer.write_all(b"account_no,first_name,last_name\n")?;
 
-    let mut bytes_written = 0;
+    let batch_size = 200_000;
+    // เปลี่ยนจาก (0..rows) เป็น (1..=rows) เพื่อให้ครบทุก row
+    let indices: Vec<usize> = (1..=rows).collect();
     let mut records_written = 0;
-    let mut last_update = Instant::now();
 
-    // Generate records in batches
-    while bytes_written < target_bytes as usize {
-        let mut batch_bytes = 0;
-
-        // Write a batch of records
-        for _ in 0..RECORDS_PER_BATCH {
-            if bytes_written >= target_bytes as usize {
-                break;
-            }
-
-            let record = generate_record();
-            let record_bytes = record.len() + 2; // +2 for CRLF
-
-            writer.write_record(&record)?;
-
-            bytes_written += record_bytes;
-            batch_bytes += record_bytes;
-            records_written += 1;
+    for (batch_i, batch_indices) in indices.chunks(batch_size).enumerate() {
+        // Generate CSV lines in parallel as a Vec<String> แล้ว join แบบไม่มี newline เกิน
+        let batch_lines: Vec<String> = batch_indices
+            .par_iter()
+            .map(|&i| {
+                let account_no = start_account_no + i - 1;
+                format!("{},{},{}", account_no, format!("FirstName{}", account_no), format!("LastName{}", account_no))
+            })
+            .collect();
+        let batch_csv = batch_lines.join("\n");
+        writer.write_all(batch_csv.as_bytes())?;
+        // เพิ่ม newline เฉพาะถ้าไม่ใช่ batch สุดท้าย
+        if (batch_i + 1) * batch_size < rows {
+            writer.write_all(b"\n")?;
         }
-
-        // Flush periodically
-        writer.flush()?;
-
-        // Show progress every second
-        let now = Instant::now();
-        if now.duration_since(last_update).as_secs() >= 1 {
-            let progress = (bytes_written as f64 / target_bytes as f64 * 100.0).min(100.0);
-            let speed = (batch_bytes as f64 / 1024.0 / 1024.0)
-                / now.duration_since(last_update).as_secs_f64();
-            println!(
-                "  - Progress: {:.1}%  Speed: {:.1} MB/s  Written: {}",
-                progress,
-                speed,
-                format_size(bytes_written, DECIMAL)
-            );
-            last_update = now;
-        }
+        records_written += batch_indices.len();
+        let elapsed = start_time.elapsed().as_secs();
+        let speed = records_written as f64 / (elapsed.max(1) as f64);
+        println!(
+            "   - {} records written ({} rec/sec)",
+            records_written, speed as usize
+        );
     }
-
-    // Final flush
     writer.flush()?;
 
-    let elapsed = start_time.elapsed();
-    let mb_per_sec = (bytes_written as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
-
-    println!("  - Completed in {:.2?}", elapsed);
-    println!("  - Records written: {}", records_written);
-    println!("  - Average speed: {:.1} MB/s", mb_per_sec);
+    let duration = start_time.elapsed();
+    let file_size = std::fs::metadata(file_path)?.len();
+    println!(
+        "   Done in {:.2}s | {} rows | {}",
+        duration.as_secs_f64(),
+        rows,
+        format_size(file_size, DECIMAL)
+    );
 
     Ok(())
-}
-
-fn generate_record() -> Vec<String> {
-    let mut rng = rand::thread_rng();
-
-    // Generate account number (10 digits)
-    let account_no: u64 = rng.gen_range(1_000_000_000..=9_999_999_999);
-
-    // Generate first name
-    let first_names = [
-        "James",
-        "Mary",
-        "John",
-        "Patricia",
-        "Robert",
-        "Jennifer",
-        "Michael",
-        "Linda",
-        "William",
-        "Elizabeth",
-        "David",
-        "Barbara",
-        "Richard",
-        "Susan",
-        "Joseph",
-        "Jessica",
-        "Thomas",
-        "Sarah",
-        "Charles",
-        "Karen",
-    ];
-    let first_name = first_names[rng.gen_range(0..first_names.len())];
-
-    // Generate last name
-    let last_names = [
-        "Smith",
-        "Johnson",
-        "Williams",
-        "Brown",
-        "Jones",
-        "Garcia",
-        "Miller",
-        "Davis",
-        "Rodriguez",
-        "Martinez",
-        "Hernandez",
-        "Lopez",
-        "Gonzalez",
-        "Wilson",
-        "Anderson",
-        "Thomas",
-        "Taylor",
-        "Moore",
-        "Jackson",
-        "Martin",
-    ];
-    let last_name = last_names[rng.gen_range(0..last_names.len())];
-
-    vec![
-        account_no.to_string(),
-        first_name.to_string(),
-        last_name.to_string(),
-    ]
 }
 
 #[cfg(test)]
@@ -172,26 +102,11 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_generate_record() {
-        let record = generate_record();
-        assert_eq!(record.len(), 3);
-        assert_eq!(record[0].len(), 10); // account_no should be 10 digits
-        assert!(!record[1].is_empty()); // first_name should not be empty
-        assert!(!record[2].is_empty()); // last_name should not be empty
-    }
-
-    #[test]
-    fn test_generate_small_csv() -> Result<()> {
+    fn test_generate_large_csv_creates_file() -> Result<()> {
         let test_file = "test_small.csv";
-
-        // Generate a small file (about 1MB)
-        generate_large_csv(test_file, 1)?;
-
-        // Verify the file exists and has content
+        generate_large_csv(test_file, 100, 1)?;
         let metadata = fs::metadata(test_file)?;
         assert!(metadata.len() > 0);
-
-        // Clean up
         fs::remove_file(test_file)?;
         Ok(())
     }
