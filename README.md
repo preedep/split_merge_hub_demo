@@ -26,21 +26,21 @@ A high-performance tool for merging and sorting large CSV files in parallel, wit
 ### Run Flow Diagram
 ```mermaid
 flowchart TD
-    A[Start: run.sh] --> B{Check input directory\nand files}
+    A[Start: run.sh] --> B{Check input directory and files}
     B -- Not found --> Z1[Error & Exit]
     B -- Found --> C[Build Rust binary]
     C -- Build fail --> Z2[Error & Exit]
-    C -- Build OK --> D[Detect system memory,\nprepare parameters]
+    C -- Build OK --> D[Detect system memory, prepare parameters]
     D --> E[Show summary & parameters]
     E --> F[Run Rust merge binary]
     F --> G[Validate headers]
     G -- Mismatch --> Z3[Error & Exit]
-    G -- OK --> H[Split each CSV file\ninto chunks (parallel)]
-    H --> I[Sort each chunk\nby key (parallel)]
-    I --> J[Write sorted chunks\nto temp files]
-    J --> K[Merge sorted chunks\nusing k-way merge]
-    K --> L[Write merged output\nto final CSV]
-    L --> M[Show summary:\nfile size, records, speed, time]
+    G -- OK --> H[Split each CSV file into chunks]
+    H --> I[Sort each chunk by key]
+    I --> J[Write sorted chunks to temp files]
+    J --> K[Merge sorted chunks using k-way merge]
+    K --> L[Write merged output to final CSV]
+    L --> M[Show summary: file size, records, speed, time]
     M --> N[Done]
     Z1["❌ Error: Input directory or files not found"]
     Z2["❌ Error: Build failed"]
@@ -68,7 +68,7 @@ The core merging is performed in parallel for maximum speed and efficiency, usin
 ```mermaid
 flowchart TD
     A[Input CSV files] --> B[Split into chunks]
-    B --> C[Sort each chunk (parallel)]
+    B --> C[Sort each chunk parallel]
     C --> D[Write sorted chunk files]
     D --> E[k-way merge sorted chunks]
     E --> F[Final merged CSV]
