@@ -15,7 +15,7 @@ MERGE_K="12"  # Default k-way merge factor; adjust as needed for your hardware
 export RUST_LOG_STYLE="always"
 export RUST_LOG="debug"
 export MERGE_K
-export MERGE_BUF_MB=256
+export MERGE_BUF_MB=512
 export MERGE_PARALLEL_GROUPS=4
 
 # Ensure input directory exists
@@ -78,11 +78,11 @@ fi
 
 # Check available memory and adjust chunk size if needed
 TOTAL_MEM_MB=$(($(sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1048576))  # Default to 8GB if can't detect
-CHUNK_SIZE_MB=256  # Default chunk size in MB
+CHUNK_SIZE_MB=4096  # Default chunk size in MB (4GB)
 
-# If we have less than 4GB of RAM, use smaller chunks
-if [ "$TOTAL_MEM_MB" -lt 4096 ]; then
-    CHUNK_SIZE_MB=128
+# If we have less than 8GB of RAM, use smaller chunks
+if [ "$TOTAL_MEM_MB" -lt 8192 ]; then
+    CHUNK_SIZE_MB=256
 fi
 
 echo "   Detected ${TOTAL_MEM_MB}MB of system memory"

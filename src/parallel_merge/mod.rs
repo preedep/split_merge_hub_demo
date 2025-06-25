@@ -408,27 +408,59 @@ pub fn merge_chunks(
         Vec::with_capacity(chunk_files.len());
     let mut heap = BinaryHeap::with_capacity(chunk_files.len());
     for (i, chunk_path) in chunk_files.iter().enumerate() {
+        debug!("Opening chunk {}: {:?}", i, chunk_path);
         match File::open(chunk_path) {
             Ok(file) => {
+                let chunk_file_size = std::fs::metadata(chunk_path).map(|m| m.len()).unwrap_or(0);
+                debug!("Chunk {} size: {} bytes", i, chunk_file_size);
                 let mut reader = ReaderBuilder::new()
                     .has_headers(false)
                     .from_reader(BufReader::with_capacity(buffer_size, file));
                 let mut record = StringRecord::new();
                 // Always skip the first record if it is a header row and this chunk has headers
                 if has_headers {
+                    debug!("Chunk {}: Skipping header record", i);
                     if !reader.read_record(&mut record)? {
                         readers.push(None);
                         continue;
                     }
+                    // เฉพาะ chunk แรก (i==0) ให้ push header ลง heap เพื่อให้ header อยู่บรรทัดแรกเท่านั้น
+                    if i == 0 {
+                        debug!("Chunk {}: Pushing header to heap: {:?}", i, record);
+                        heap.push(MergeRecord {
+                            record: record.clone(),
+                            source_index: i,
+                        });
+                    }
                 }
                 if reader.read_record(&mut record)? {
+                    if record.len() != headers.len() {
+                        error!(
+                            "CSV format error at chunk {} (file: {:?}), record (line {}): expected {} fields, found {} fields. Record: {:?}",
+                            i,
+                            chunk_path,
+                            if has_headers { 2 } else { 1 }, // แถวแรกหลัง header หรือแถวแรกสุด
+                            headers.len(),
+                            record.len(),
+                            record
+                        );
+                    } else {
+                        debug!(
+                            "Chunk {} (file: {:?}), record (line {}): OK, fields: {}. Record: {:?}",
+                            i,
+                            chunk_path,
+                            if has_headers { 2 } else { 1 },
+                            record.len(),
+                            record
+                        );
+                    }
                     heap.push(MergeRecord {
                         record,
                         source_index: i,
                     });
                     readers.push(Some(reader));
                 } else {
-                    readers.push(None);
+                    readers.push(Some(reader));
                 }
             }
             Err(e) => {
@@ -437,6 +469,7 @@ pub fn merge_chunks(
             }
         }
     }
+    debug!("All chunk files opened and initial records pushed to heap. Heap size: {}", heap.len());
     let mut writer = {
         let file = File::create(output_path)
             .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
@@ -447,26 +480,38 @@ pub fn merge_chunks(
     writer
         .write_record(headers.iter())
         .with_context(|| "Failed to write headers to output file")?;
+    debug!("Wrote headers to output: {:?}", output_path);
+    let mut merged_record_count = 0u64;
+    let mut skipped_record_count = 0u64;
     while let Some(MergeRecord {
         record,
         source_index,
     }) = heap.pop()
     {
-        writer.write_record(&record)?;
-        if let Some(reader_opt) = readers.get_mut(source_index) {
-            if let Some(reader) = reader_opt {
-                let mut record = StringRecord::new();
-                if reader.read_record(&mut record)? {
-                    heap.push(MergeRecord {
-                        record,
-                        source_index,
-                    });
-                } else {
-                    *reader_opt = None;
-                }
-            }
+        debug!(
+            "Merging record from chunk {}: fields: {}, Record: {:?}",
+            source_index,
+            record.len(),
+            record
+        );
+        if record.len() != headers.len() {
+            error!(
+                "CSV format error while merging from chunk {}: expected {} fields, found {} fields. Record: {:?}",
+                source_index,
+                headers.len(),
+                record.len(),
+                record
+            );
+            skipped_record_count += 1;
+            continue;
         }
+        writer.write_record(record.iter())?;
+        merged_record_count += 1;
     }
+    info!(
+        "Merge complete: output {:?}, total merged records: {}, skipped: {}",
+        output_path, merged_record_count, skipped_record_count
+    );
     writer.flush()?;
     debug!("merge_chunks finished in: {:?}", t0.elapsed());
     Ok(())
