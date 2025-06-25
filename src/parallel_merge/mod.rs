@@ -208,7 +208,8 @@ pub fn parallel_split_file_to_chunks(
             debug!("[SPLIT] Chunk {} first 3 rows: {:?}", i, &records.iter().take(3).collect::<Vec<_>>());
             debug!("[SPLIT] Chunk {} last 3 rows: {:?}", i, &records.iter().rev().take(3).collect::<Vec<_>>());
         }
-        let chunk_path = temp_dir.path().join(format!("chunk_parallel_{}.csv", i));
+        let file_stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("input");
+        let chunk_path = temp_dir.path().join(format!("chunk_parallel_{}_{}.csv", file_stem, i));
         let write_start = Instant::now();
         let mut wtr = WriterBuilder::new().has_headers(true).from_path(&chunk_path)?;
         wtr.write_record(headers)?;
@@ -255,14 +256,16 @@ pub fn parallel_merge_sort(
     if input_paths.is_empty() {
         return Err(anyhow::anyhow!("No input files provided"));
     }
-    let headers = validate_headers(input_paths)?;
+    let mut input_paths_sorted = input_paths.to_vec();
+    input_paths_sorted.sort_by_key(|p| p.to_string_lossy().to_string());
+    let headers = validate_headers(&input_paths_sorted)?;
     info!(
         "Validated headers across all input files: {:?}",
         headers.iter().collect::<Vec<_>>()
     );
     info!(
         "Starting parallel merge sort for {} files",
-        input_paths.len().to_string()
+        input_paths_sorted.len().to_string()
     );
     let temp_dir = TempDir::new()?;
     let total_start = Instant::now();
@@ -271,13 +274,14 @@ pub fn parallel_merge_sort(
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
-    let all_chunks: Vec<PathBuf> = input_paths
-        .par_iter()
+    // Split each input file deterministically and collect chunks in same order
+    let chunk_lists: Vec<_> = input_paths_sorted
+        .iter()
         .map(|path| parallel_split_file_to_chunks(path, &temp_dir, sort_columns, chunk_size_mb, &headers))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
+    let mut all_chunks: Vec<PathBuf> = chunk_lists.into_iter().flatten().collect();
+    // Sort chunk paths for deterministic merge order
+    all_chunks.sort_by_key(|p| p.to_string_lossy().to_string());
     info!("Split phase finished in: {:?}", split_start.elapsed());
 
     info!("Starting merge phase...");
@@ -388,13 +392,15 @@ fn merge_k_files(
         .iter()
         .map(|path| {
             let file = File::open(path)?;
-            let rdr = ReaderBuilder::new().has_headers(true).from_reader(BufReader::new(file));
+            let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(BufReader::new(file));
+            // Always skip header row for every chunk
+            let _ = rdr.headers();
             Ok(rdr)
         })
         .collect::<Result<Vec<_>>>()?;
 
     // Prepare output writer
-    let mut wtr = WriterBuilder::new().has_headers(false).from_path(output_path)?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_path(output_path)?;
     // Write header only if this is the final output
     if output_path.extension().and_then(|s| s.to_str()) == Some("csv") {
         wtr.write_record(headers.iter())?;
