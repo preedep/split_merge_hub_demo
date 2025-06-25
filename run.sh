@@ -174,7 +174,7 @@ echo "   Output file: ${OUTPUT_FILE}"
 
 if [ "$FILE_SIZE" != "unknown" ]; then
     echo "   File size: ${FILE_SIZE}"
-    
+
     # Check if output file was created and has content
     if [ ! -s "$OUTPUT_FILE" ]; then
         echo "⚠️  Warning: Output file is empty"

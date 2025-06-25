@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::TempDir;
-use std::collections::BinaryHeap;
 
 // --- MergeRecord struct for heap ---
 #[derive(Debug)]
@@ -185,14 +184,9 @@ pub fn parallel_split_file_to_chunks(
     let chunk_count = (all_records.len() + chunk_size - 1) / chunk_size;
     info!(
         "[split] Pre-scan complete. File: {:?}, Size: {} bytes, Records: {}, Chunks: {}, ChunkSize: {} (records), Pre-scan Time: {:.2?}",
-        file_path,
-        file_size,
-        all_records.len(),
-        chunk_count,
-        chunk_size,
-        prescan_elapsed
+        file_path, fmtnum(file_size), fmtnum(all_records.len()), fmtnum(chunk_count), fmtnum(chunk_size), prescan_elapsed
     );
-    info!("[split] Processing {} chunks in parallel...", chunk_count);
+    info!("[split] Processing {} chunks in parallel...", fmtnum(chunk_count));
     let chunk_timer = Instant::now();
     let chunk_paths: Result<Vec<PathBuf>> = (0..chunk_count).into_par_iter().map(|i| -> Result<PathBuf> {
         let chunk_start_time = Instant::now();
@@ -221,13 +215,7 @@ pub fn parallel_split_file_to_chunks(
         let chunk_elapsed = chunk_start_time.elapsed();
         info!(
             "[split] Chunk {}/{} | Records: {} | Path: {:?} | Sort: {:.2?} | Write: {:.2?} | Total: {:.2?}",
-            i + 1,
-            chunk_count,
-            records.len(),
-            chunk_path,
-            sort_elapsed,
-            write_elapsed,
-            chunk_elapsed
+            i + 1, fmtnum(chunk_count), fmtnum(records.len()), chunk_path, sort_elapsed, write_elapsed, chunk_elapsed
         );
         Ok(chunk_path)
     }).collect();
@@ -238,10 +226,7 @@ pub fn parallel_split_file_to_chunks(
     };
     info!(
         "[split] ALL DONE. File: {:?}, Size: {} bytes, Chunks: {}, Time: {:.2?}",
-        file_path,
-        file_size,
-        chunk_count,
-        chunk_total_elapsed
+        file_path, fmtnum(file_size), fmtnum(chunk_count), chunk_total_elapsed
     );
     chunk_paths
 }
@@ -265,7 +250,7 @@ pub fn parallel_merge_sort(
     );
     info!(
         "Starting parallel merge sort for {} files",
-        input_paths_sorted.len().to_string()
+        fmtnum(input_paths_sorted.len())
     );
     let temp_dir = TempDir::new()?;
     let total_start = Instant::now();
@@ -297,7 +282,7 @@ pub fn parallel_merge_sort(
         },
         Err(_) => 2,
     };
-    info!("Using k-way merge: k={}", k);
+    info!("Using k-way merge: k={}", fmtnum(k));
     parallel_merge_chunks(all_chunks, output_path.as_ref(), sort_columns, k)?;
     info!("Merge phase finished in: {:?}", merge_start.elapsed());
 
@@ -322,7 +307,7 @@ pub fn parallel_merge_chunks(
     if chunk_paths.is_empty() {
         return Err(anyhow::anyhow!("No chunk files to merge"));
     }
-    info!("[merge] Starting k-way merge: {} chunks -> {:?}", chunk_paths.len(), output_path);
+    info!("[merge] Starting k-way merge: {} chunks -> {:?}", fmtnum(chunk_paths.len()), output_path);
     let merge_start = Instant::now();
 
     // Read headers from the first chunk
@@ -352,11 +337,11 @@ pub fn parallel_merge_chunks(
         _temp_dirs.push(temp_dir); // <-- keep temp_dir alive
         let temp_dir_ref = _temp_dirs.last().unwrap();
         let groups = current_chunks.chunks(k).enumerate();
-        info!("[merge] Merge pass {}: {} groups of up to {} files", pass, (current_chunks.len() + k - 1) / k, k);
+        info!("[merge] Merge pass {}: {} groups of up to {} files", pass, (current_chunks.len() + k - 1) / k, fmtnum(k));
 
         for (group_idx, group) in groups {
             let out_path = temp_dir_ref.path().join(format!("merge_pass{}_group{}.csv", pass, group_idx));
-            info!("[merge]   Group {}: merging {} files -> {:?}", group_idx, group.len(), out_path);
+            info!("[merge]   Group {}: merging {} files -> {:?}", group_idx, fmtnum(group.len()), out_path);
             merge_k_files(group, &out_path, &headers, &sort_indices)?;
             next_chunks.push(out_path);
         }
@@ -365,7 +350,7 @@ pub fn parallel_merge_chunks(
     // Final merge (or only pass if <= k)
     let final_chunks = if current_chunks.is_empty() { vec![] } else { current_chunks };
     if !final_chunks.is_empty() {
-        info!("[merge] Final merge: {} files -> {:?}", final_chunks.len(), output_path);
+        info!("[merge] Final merge: {} files -> {:?}", fmtnum(final_chunks.len()), output_path);
         merge_k_files(&final_chunks, output_path, &headers, &sort_indices)?;
     }
     wtr.flush()?;
@@ -433,4 +418,7 @@ fn merge_k_files(
     Ok(())
 }
 
-// ... rest of the code remains the same ...
+// --- Example: format_number helper ---
+fn fmtnum<N: ToFormattedString>(n: N) -> String {
+    n.to_formatted_string(&Locale::en)
+}
