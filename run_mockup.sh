@@ -1,1 +1,1 @@
-cargo run --release --bin generate_large_files -- 1000000
+cargo run --release --bin generate_large_files -- 50000000
