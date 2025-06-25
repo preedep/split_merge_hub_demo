@@ -24,5 +24,8 @@ target/
 # Added by cargo
 
 /target
-/.idea/material_theme_project_new.xml
-/.idea/.gitignore
+/.idea/*
+/large_files/*
+/merge_files/*
+
+

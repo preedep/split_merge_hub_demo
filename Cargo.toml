@@ -1,6 +1,32 @@
 [package]
 name = "split_merge_hub_demo"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A tool for efficiently merging and splitting large CSV files with parallel processing"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT"
+repository = ""
+readme = "README.md"
+
+[[bin]]
+name = "split_merge_hub_demo"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "generate_large_files"
+path = "src/bin/generate_large_files.rs"
+
 
 [dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+humansize = "2.1"
+pretty_env_logger = "0.5"
+log = "0.4"
+csv = { version = "1.3" }
+tempfile = "3.10"
+anyhow = "1.0"
+rand = "0.9"
+rayon = "1.10"
+chrono = "0.4"
+num_cpus = "1.16"
+num-format = "0.4"
