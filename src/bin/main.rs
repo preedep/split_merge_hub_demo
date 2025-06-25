@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::slice::ParallelSliceMut;
-use split_merge_hub_demo::parallel_merge::parallel_merge_sort;
+use split_merge_hub_demo::parallel_merge::*;
+
 /// A tool for splitting and merging CSV files with parallel processing
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -138,9 +139,9 @@ fn concatenate_files(files: &[PathBuf], output_file: &str, headers: &StringRecor
         .context("Failed to write headers")?;
 
     // Concatenate all files
-    for (i, file) in files.iter().enumerate() {
+    for file in files.iter() {
         let mut rdr = ReaderBuilder::new()
-            .has_headers(i > 0) // Skip headers for all but the first file
+            .has_headers(true) // Always skip header row automatically
             .from_path(file)
             .with_context(|| format!("Failed to open input file: {}", file.display()))?;
 
