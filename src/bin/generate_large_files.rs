@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{Duration, NaiveDateTime, Utc};
 use humansize::{format_size, DECIMAL};
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -55,7 +56,7 @@ fn generate_large_csv(file_path: &str, rows: usize, _start_account_no: usize) ->
     let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file); // 16MB buffer
 
     // Write header
-    writer.write_all(b"account_no,first_name,last_name\n")?;
+    writer.write_all(b"transaction_date,account_no,first_name,last_name,address\n")?;
 
     let batch_size = 200_000;
     // สุ่ม account_no ไม่เรียงและไม่ซ้ำ
@@ -70,11 +71,18 @@ fn generate_large_csv(file_path: &str, rows: usize, _start_account_no: usize) ->
         let batch_lines: Vec<String> = batch_indices
             .par_iter()
             .map(|&account_no| {
+                // Random transaction_date: between 2020-01-01 00:00:00 and now
+                let start = NaiveDateTime::parse_from_str("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+                let now = Utc::now().naive_utc();
+                let duration = now - start;
+                let mut rng = rand::thread_rng();
+                let random_secs = rng.gen_range(0..duration.num_seconds());
+                let transaction_date = start + Duration::seconds(random_secs);
+                // Random address
+                let address = format!("Address{}", rng.gen_range(100000..999999));
                 format!(
-                    "{},{},{}",
-                    account_no,
-                    format!("FirstName{}", account_no),
-                    format!("LastName{}", account_no)
+                    "{},{},{},{},{}",
+                    transaction_date.format("%Y-%m-%d %H:%M:%S"), account_no,  format!("FirstName{}", account_no),  format!("LastName{}", account_no),  address
                 )
             })
             .collect();
