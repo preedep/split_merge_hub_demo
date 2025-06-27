@@ -97,7 +97,8 @@ cargo run --bin split_merge_hub_demo --release -- merge "${INPUT_FILES[@]}" -o "
 MERGE_STATUS=$?
 
 END_TIME=$(date +%s)
-DURATION=$((END_TIME - START_TIME))
+DURATION_SEC=$((END_TIME - START_TIME))
+DURATION_MIN=$(awk "BEGIN {printf \"%.2f\", $DURATION_SEC/60}")
 
 if [ $MERGE_STATUS -ne 0 ]; then
     echo " MT Log merge failed"
@@ -109,21 +110,20 @@ echo " MT Log merge completed: $OUTPUT_FILE"
 # Get file size in human-readable format
 if command -v du &> /dev/null; then
     FILE_SIZE=$(du -h "$OUTPUT_FILE" 2>/dev/null | cut -f1 || echo "unknown")
-    # Get line count if available
-    if command -v wc &> /dev/null; then
-        LINE_COUNT=$(wc -l < "$OUTPUT_FILE" 2>/dev/null || echo "unknown")
-    fi
-else
-    FILE_SIZE="unknown"
-    LINE_COUNT="unknown"
 fi
 
-echo -e "\n==== Merge Summary ===="
-echo "   Output file: $OUTPUT_FILE"
-echo "   File size: $FILE_SIZE"
-echo "   Total records: $LINE_COUNT"
-echo "   Total input size: $HUMAN_SIZE"
-echo "   Duration: ${DURATION}s"
+# Count number of rows (lines) in output file (by new line)
+LINE_COUNT=$(wc -l < "$OUTPUT_FILE")
+
+# Display summary
+cat <<EOF
+==== Merge Summary ====
+   Output file: $OUTPUT_FILE
+   File size:  $FILE_SIZE
+   Total records:  $LINE_COUNT
+   Total input size: $HUMAN_SIZE
+   Duration: ${DURATION_SEC}s (${DURATION_MIN} min)
+EOF
 
 if [ ! -s "$OUTPUT_FILE" ]; then
     echo "⚠️  Warning: Output file is empty"
