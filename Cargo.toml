@@ -16,6 +16,9 @@ path = "src/bin/main.rs"
 name = "generate_large_files"
 path = "src/bin/generate_large_files.rs"
 
+[[bin]]
+name = "generate_mt_log_large_files"
+path = "src/bin/generate_mt_log_large_files.rs"
 
 [dependencies]
 clap = { version = "4.5.40", features = ["derive"] }

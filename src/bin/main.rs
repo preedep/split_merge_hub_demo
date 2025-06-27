@@ -4,14 +4,14 @@ use clap::{Parser, Subcommand};
 use csv::{ReaderBuilder, StringRecord, WriterBuilder};
 use log::{debug, info};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufReader, BufWriter, Write, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::slice::ParallelSliceMut;
 use split_merge_hub_demo::parallel_merge::*;
 
-/// A tool for splitting and merging CSV files with parallel processing
+/// A tool for splitting and merging CSV files or MT log files with parallel processing
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -21,9 +21,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Merge multiple CSV files into one
+    /// Merge multiple CSV files or MT log files into one
     Merge {
-        /// Input CSV files to merge
+        /// Input files to merge (CSV or MT log)
         #[arg(required = true)]
         input_files: Vec<String>,
 
@@ -31,13 +31,21 @@ enum Commands {
         #[arg(short, long)]
         output: String,
 
-        /// Columns to sort by (comma-separated)
+        /// Columns to sort by (comma-separated, for CSV only)
         #[arg(long, value_delimiter = ',')]
         sort_by: Vec<String>,
 
         /// Chunk size in MB for processing large files
         #[arg(long, default_value = "500")]
         chunk_size: usize,
+
+        /// MT log mode (merge as fixed-width MT log, no CSV header/columns)
+        #[arg(long, default_value = "false")]
+        mt_log: bool,
+
+        /// MT log sort columns (e.g. 0:date,1:time,5:num)
+        #[arg(long, value_delimiter = ',')]
+        mtlog_sort_cols: Vec<String>,
     },
 
     /// Split a CSV file into smaller chunks
@@ -72,11 +80,19 @@ fn main() -> Result<()> {
             output,
             sort_by,
             chunk_size,
+            mt_log,
+            mtlog_sort_cols,
         } => unsafe {
             // Set the chunk size as an environment variable
             std::env::set_var("CHUNK_SIZE_MB", chunk_size.to_string());
             let sort_columns: Vec<&str> = sort_by.iter().map(|s| s.as_str()).collect();
-            merge_csv_files(&input_files, &output, &sort_columns)
+            if mt_log {
+                let input_paths: Vec<std::path::PathBuf> = input_files.iter().map(std::path::PathBuf::from).collect();
+                let sort_columns = parse_mtlog_sort_cols(&mtlog_sort_cols)?;
+                split_merge_hub_demo::parallel_merge::parallel_merge_sort_mtlog(&input_paths, &output, &sort_columns)
+            } else {
+                merge_csv_files(&input_files, &output, &sort_columns)
+            }
         },
         Commands::Split {
             input_file,
@@ -327,4 +343,52 @@ fn external_sort(
     wtr.flush()?;
 
     Ok(())
+}
+
+/// Merges multiple MT log files (fixed-width, no header) into one output file
+fn merge_mt_log_files(input_files: &[String], output_file: &str) -> Result<()> {
+    info!("Merging {} MT log files into {} (fixed-width mode)", input_files.len(), output_file);
+    let start_time = Instant::now();
+    let input_paths: Vec<PathBuf> = input_files.iter().map(PathBuf::from).collect();
+    let mut writer = BufWriter::new(File::create(output_file)?);
+    let mut total_lines = 0u64;
+    for path in &input_paths {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            total_lines += 1;
+        }
+    }
+    writer.flush()?;
+    let elapsed = start_time.elapsed();
+    info!("✅ Merged {} MT log files ({} lines) into {} in {:.2?}", input_files.len(), total_lines, output_file, elapsed);
+    Ok(())
+}
+
+/// Parse mtlog sort columns from CLI (e.g. 0:date,1:time,5:num)
+fn parse_mtlog_sort_cols(cols: &[String]) -> Result<Vec<split_merge_hub_demo::parallel_merge::MTLogSortColumn>> {
+    use split_merge_hub_demo::parallel_merge::{MTLogSortColumn, MTLogSortType};
+    let mut result = Vec::new();
+    for col in cols {
+        let parts: Vec<&str> = col.split(':').collect();
+        if parts.len() == 2 {
+            let idx = parts[0].parse::<usize>().map_err(|_| anyhow::anyhow!("Invalid column index: {}", parts[0]))?;
+            let col_type = match parts[1].to_lowercase().as_str() {
+                "date" => MTLogSortType::Date,
+                "time" => MTLogSortType::Time,
+                "num" => MTLogSortType::Num,
+                _ => MTLogSortType::Str,
+            };
+            result.push(MTLogSortColumn { index: idx, col_type });
+        } else if parts.len() == 1 {
+            let idx = parts[0].parse::<usize>().map_err(|_| anyhow::anyhow!("Invalid column index: {}", parts[0]))?;
+            result.push(MTLogSortColumn { index: idx, col_type: MTLogSortType::Str });
+        } else {
+            return Err(anyhow::anyhow!("Invalid sort column format: {}", col));
+        }
+    }
+    Ok(result)
 }
