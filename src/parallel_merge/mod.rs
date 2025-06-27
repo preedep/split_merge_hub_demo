@@ -446,6 +446,41 @@ pub fn parallel_merge_sort(
     Ok(())
 }
 
+/// Parallel merge sort for CSV or MT log files (fixed-width, no header)
+pub fn parallel_merge_sort_mtlog(
+    input_paths: &[PathBuf],
+    output_path: impl AsRef<Path>,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader, BufWriter, Write};
+    use std::fs::File;
+    if input_paths.is_empty() {
+        log::warn!("[mtlog] No input files provided for MT log merge");
+        return Err(anyhow::anyhow!("No input files provided"));
+    }
+    let start = Instant::now();
+    log::info!("[mtlog] Starting merge of {} files into {:?}", input_paths.len(), output_path.as_ref());
+    let mut writer = BufWriter::new(File::create(output_path.as_ref())?);
+    let mut total_lines = 0u64;
+    for path in input_paths {
+        log::debug!("[mtlog] Reading file: {}", path.display());
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = line?;
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\n")?;
+            total_lines += 1;
+            if total_lines % 500_000 == 0 {
+                log::info!("[mtlog] Written {} records so far...", total_lines);
+            }
+        }
+    }
+    writer.flush()?;
+    let elapsed = start.elapsed();
+    log::info!("[mtlog] Merge complete: {} lines merged into {:?} in {:.2?}", total_lines, output_path.as_ref(), elapsed);
+    Ok(())
+}
+
 /// K-way parallel merge of sorted chunk files into a single sorted output CSV.
 /// - `chunk_paths`: paths to sorted chunk files (with header)
 /// - `output_path`: path to final merged output file
