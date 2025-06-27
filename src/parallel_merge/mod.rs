@@ -460,6 +460,71 @@ pub struct MTLogSortColumn {
     pub col_type: MTLogSortType,
 }
 
+/// Performs a parallel merge sort on multiple MT log files.
+///
+/// This function reads multiple input files, splits the data into chunks, 
+/// sorts the chunks in parallel, and then performs a k-way merge to create
+/// a single sorted output file. It is designed for large-scale log processing 
+/// and can efficiently handle millions of records.
+///
+/// # Parameters
+/// - `input_paths`: A slice of `PathBuf` representing the paths to the input files to be merged.
+/// - `output_path`: The path to the output file where the merged and sorted logs will be written.
+/// - `sort_columns`: A slice of `MTLogSortColumn` which defines the sort key(s) and order for the records.
+///
+/// # Environment Variables
+/// - `CHUNK_RECORDS` (optional): Specifies the number of records per chunk for parallel processing.
+///   Defaults to 1,000,000 if unset.
+///
+/// # Process
+/// 1. **Chunk Splitting and Sorting:**
+///     - Reads input files line by line.
+///     - Groups records into chunks based on `CHUNK_RECORDS`.
+///     - Each chunk is sorted based on the `sort_columns` using parallel processing.
+///     - Temporary files are created for each sorted chunk.
+///
+/// 2. **K-Way Merge:**
+///     - Merges all sorted chunks into one sorted output file using a binary heap for efficiency.
+///     - Continuously writes merged records to the output file.
+///
+/// 3. **Logging:**
+///     - Logs progress during chunk creation, sorting, and merging.
+///     - Provides elapsed time and record count statistics for each step.
+///
+/// # Returns
+/// - `Ok(())` if the process completes successfully.
+/// - `Err(anyhow::Error)` if any error occurs during the process, such as I/O failures.
+///
+/// # Errors
+/// Possible errors include:
+/// - Missing or invalid input files in `input_paths`.
+/// - I/O errors when reading from input files, writing to temporary chunk files, or writing the output file.
+/// - Sorting logic errors due to malformed input or incorrect column specifications.
+///
+/// # Example Usage
+/// ```rust
+/// use std::path::PathBuf;
+/// use my_crate::{parallel_merge_sort_mtlog, MTLogSortColumn};
+///
+/// let input_paths = vec![PathBuf::from("log1.txt"), PathBuf::from("log2.txt")];
+/// let output_path = PathBuf::from("merged_log.txt");
+/// let sort_columns = vec![MTLogSortColumn::Timestamp, MTLogSortColumn::Severity];
+///
+/// parallel_merge_sort_mtlog(&input_paths, output_path, &sort_columns).unwrap();
+/// ```
+///
+/// # Performance
+/// - The function uses multithreading and parallel sorting to handle large input efficiently.
+/// - Sorting is performed using `par_sort_unstable`, and the k-way merge is optimized with a binary heap.
+///
+/// # Notes
+/// - Ensure the input files are compatible with the expected format and sorting criteria.
+/// - Temporary files created during the process are automatically removed after merging completes.
+///
+/// # Dependencies
+/// - `rayon`: Used for parallel sorting.
+/// - `tempfile`: Used for creating and managing temporary chunk files.
+/// - `log`: Used for logging the progress of the operation.
 pub fn parallel_merge_sort_mtlog(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
@@ -578,6 +643,56 @@ impl<'a> PartialEq for MTLogHeapItem<'a> {
     }
 }
 
+/// Compares two MTLog entries represented as strings (`a` and `b`) based on the specified sort columns.
+///
+/// This function iterates through the provided list of `sort_columns` to determine the ordering comparison
+/// between the two MTLog entries. Each `MTLogSortColumn` in the list specifies both the column index 
+/// and the type of sorting to apply (e.g., Date, Time, Num, Str). The order of the `sort_columns` array 
+/// determines the precedence for comparison.
+///
+/// # Arguments
+///
+/// * `a` - A string slice representing the first MTLog entry to compare.
+/// * `b` - A string slice representing the second MTLog entry to compare.
+/// * `sort_columns` - A slice of `MTLogSortColumn` structs specifying which columns and sorting 
+///   types (e.g., Date, Time, Num, Str) to use for comparison.
+///
+/// # Returns
+///
+/// A `std::cmp::Ordering` value:
+/// * `Ordering::Less` if `a` is smaller than `b` based on the sort columns.
+/// * `Ordering::Greater` if `a` is greater than `b` based on the sort columns.
+/// * `Ordering::Equal` if both `a` and `b` are considered equal based on the sort columns.
+///
+/// The function performs the following for each column in `sort_columns`:
+/// 1. Extracts the values for both `a` and `b` using the `get_mtlog_field` function based on the column index.
+/// 2. Compares the extracted values using the rules defined by the column's type:
+///    - `MTLogSortType::Date` or `MTLogSortType::Time`: Lexicographical comparison of the strings.
+///    - `MTLogSortType::Num`: Parsing to `u64` for comparison, with a fallback to `0` if parsing fails.
+///    - `MTLogSortType::Str`: Lexicographical string comparison.
+/// 3. If the comparison result for the current column is not equal, return the comparison result immediately.
+/// 4. If all columns are equal, return `Ordering::Equal`.
+///
+/// # Panics
+///
+/// This function assumes that the `get_mtlog_field` function will provide valid field values
+/// for the specified column indexes and may panic if an invalid index is used or if there's a 
+/// logic issue in `get_mtlog_field`.
+///
+/// # Examples
+///
+/// ```rust
+/// // Example usage of compare_mtlog_by_columns
+/// let mtlog1 = "2023-09-15 12:00:00,INFO,User logged in";
+/// let mtlog2 = "2023-09-15 12:05:00,INFO,User logged out";
+/// let sort_columns = vec![
+///     MTLogSortColumn { index: 0, col_type: MTLogSortType::Date },
+///     MTLogSortColumn { index: 1, col_type: MTLogSortType::Time },
+/// ];
+///
+/// let result = compare_mtlog_by_columns(mtlog1, mtlog2, &sort_columns);
+/// assert_eq!(result, std::cmp::Ordering::Less);
+/// ```
 fn compare_mtlog_by_columns(a: &str, b: &str, sort_columns: &[MTLogSortColumn]) -> std::cmp::Ordering {
     for col in sort_columns {
         let (v1, v2) = (get_mtlog_field(a, col.index), get_mtlog_field(b, col.index));
