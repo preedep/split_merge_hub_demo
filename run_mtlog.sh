@@ -17,6 +17,10 @@ export MERGE_K
 export MERGE_BUF_MB=512
 export MERGE_PARALLEL_GROUPS=4
 
+export CHUNK_RECORDS=500000
+# Set sort columns for MT log (date, time)
+MTLOG_SORT_COLS="0:date,1:time"
+
 # Ensure input directory exists
 if [ ! -d "$INPUT_DIR" ]; then
     echo " Error: Input directory not found: $INPUT_DIR"
@@ -89,7 +93,7 @@ echo "Merging files into $OUTPUT_FILE (MT log mode) ..."
 START_TIME=$(date +%s)
 
 # Merge using --mt-log parameter
-cargo run --bin split_merge_hub_demo --release -- merge "${INPUT_FILES[@]}" -o "$OUTPUT_FILE" --mt-log
+cargo run --bin split_merge_hub_demo --release -- merge "${INPUT_FILES[@]}" -o "$OUTPUT_FILE" --mt-log --mtlog-sort-cols "$MTLOG_SORT_COLS"
 MERGE_STATUS=$?
 
 END_TIME=$(date +%s)

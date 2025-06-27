@@ -16,10 +16,17 @@ fn random_date<R: Rng>(rng: &mut R) -> String {
     format!("{:04}{:02}{:02}", year, month, day)
 }
 
+fn random_time_hhmmss<R: Rng>(rng: &mut R) -> String {
+    let hour = rng.gen_range(0..=23);
+    let min = rng.gen_range(0..=59);
+    let sec = rng.gen_range(0..=59);
+    format!("{:02}{:02}{:02}", hour, min, sec)
+}
+
 fn random_mt_log_record<R: Rng>(rng: &mut R) -> MTLogRecord {
     MTLogRecord {
         milog_rec_sys_date: random_date(rng).parse().unwrap(),
-        milog_rec_sys_time: rng.gen_range(0..=235959),
+        milog_rec_sys_time: random_time_hhmmss(rng),
         milog_rec_taskno: rng.gen_range(1000000..=9999999),
         milog_channel_code: "ATM".to_string(),
         milog_rec_rectype: "1".to_string(),
@@ -42,7 +49,7 @@ fn random_mt_log_record<R: Rng>(rng: &mut R) -> MTLogRecord {
         mit_isc_front_end_login_id: "LOGINID".to_string(),
         mit_isc_front_end_tran_serno: rng.gen_range(0..=999999),
         mit_isc_reversal_flag: "N".to_string(),
-        mit_isc_tran_time: format!("{:06}", rng.gen_range(0..=235959)),
+        mit_isc_tran_time: random_time_hhmmss(rng),
         mit_isc_tran_posting_date: random_date(rng),
         mit_isc_tran_branch_code: format!("{:04}", rng.gen_range(0..=9999)),
         mit_isc_channel_code: "CHN1".to_string(),

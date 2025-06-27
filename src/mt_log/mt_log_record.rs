@@ -3,7 +3,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct MTLogRecord {
     pub milog_rec_sys_date: u64,
-    pub milog_rec_sys_time: u64,
+    pub milog_rec_sys_time: String,
     pub milog_rec_taskno: u64,
     pub milog_channel_code: String,
     pub milog_rec_rectype: String,
@@ -143,7 +143,7 @@ impl MTLogRecord {
         }
         Ok(Self {
             milog_rec_sys_date: input[0..8].trim().parse::<u64>().unwrap_or(0),
-            milog_rec_sys_time: input[8..14].trim().parse::<u64>().unwrap_or(0),
+            milog_rec_sys_time: input[8..14].trim().to_string(),
             milog_rec_taskno: input[14..21].trim().parse::<u64>().unwrap_or(0),
             milog_channel_code: input[21..25].trim().to_string(),
             milog_rec_rectype: input[25..26].trim().to_string(),
@@ -279,7 +279,7 @@ impl MTLogRecord {
     pub fn to_fixed_string(&self) -> String {
         let mut s = String::with_capacity(TOTAL_LENGTH);
         s.push_str(&format!("{:0>8}", self.milog_rec_sys_date));
-        s.push_str(&format!("{:0>6}", self.milog_rec_sys_time));
+        s.push_str(&format!("{:<6}", self.milog_rec_sys_time));
         s.push_str(&format!("{:0>7}", self.milog_rec_taskno));
         s.push_str(&format!("{:<4}", self.milog_channel_code));
         s.push_str(&format!("{:<1}", self.milog_rec_rectype));

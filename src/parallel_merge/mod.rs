@@ -446,39 +446,173 @@ pub fn parallel_merge_sort(
     Ok(())
 }
 
-/// Parallel merge sort for CSV or MT log files (fixed-width, no header)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MTLogSortType {
+    Date,
+    Time,
+    Num,
+    Str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MTLogSortColumn {
+    pub index: usize,
+    pub col_type: MTLogSortType,
+}
+
 pub fn parallel_merge_sort_mtlog(
     input_paths: &[PathBuf],
     output_path: impl AsRef<Path>,
+    sort_columns: &[MTLogSortColumn],
 ) -> Result<()> {
     use std::io::{BufRead, BufReader, BufWriter, Write};
     use std::fs::File;
+    use std::collections::BinaryHeap;
+    use std::cmp::Ordering;
+    use std::time::Instant;
+    
+    let total_timer = Instant::now();
     if input_paths.is_empty() {
         log::warn!("[mtlog] No input files provided for MT log merge");
         return Err(anyhow::anyhow!("No input files provided"));
     }
-    let start = Instant::now();
-    log::info!("[mtlog] Starting merge of {} files into {:?}", input_paths.len(), output_path.as_ref());
-    let mut writer = BufWriter::new(File::create(output_path.as_ref())?);
-    let mut total_lines = 0u64;
+    log::info!("[mtlog] Starting parallel chunked merge of {} files into {:?}", input_paths.len().to_formatted_string(&Locale::en), output_path.as_ref());
+
+    // 1. Split to sorted chunks in parallel (by number of records)
+    let chunk_records = std::env::var("CHUNK_RECORDS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1_000_000);
+    log::info!("[mtlog] Chunk size: {} records", chunk_records.to_formatted_string(&Locale::en));
+    let mut chunk_files = Vec::new();
+    let mut all_lines = Vec::new();
+    let mut cur_records = 0;
+    let chunk_timer = Instant::now();
+    let mut total_records: usize = 0;
     for path in input_paths {
-        log::debug!("[mtlog] Reading file: {}", path.display());
+        log::info!("[mtlog] Reading input file: {}", path.display());
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
             let line = line?;
-            writer.write_all(line.as_bytes())?;
-            writer.write_all(b"\n")?;
-            total_lines += 1;
-            if total_lines % 500_000 == 0 {
-                log::info!("[mtlog] Written {} records so far...", total_lines);
+            cur_records += 1;
+            total_records += 1;
+            all_lines.push(line);
+            if cur_records >= chunk_records {
+                let mut chunk = std::mem::take(&mut all_lines);
+                cur_records = 0;
+                let sort_timer = Instant::now();
+                chunk.par_sort_unstable_by(|a, b| compare_mtlog_by_columns(a, b, sort_columns));
+                log::info!("[mtlog] Sorted chunk of {} records in {:.2?}", chunk.len().to_formatted_string(&Locale::en), sort_timer.elapsed());
+                let mut tmp = tempfile::NamedTempFile::new()?;
+                for l in &chunk { writeln!(tmp, "{}", l)?; }
+                chunk_files.push(tmp.into_temp_path());
+                log::info!("[mtlog] Wrote sorted chunk file #{} ({} records)", chunk_files.len().to_formatted_string(&Locale::en), chunk.len().to_formatted_string(&Locale::en));
             }
         }
     }
+    if !all_lines.is_empty() {
+        let sort_timer = Instant::now();
+        all_lines.par_sort_unstable_by(|a, b| compare_mtlog_by_columns(a, b, sort_columns));
+        log::info!("[mtlog] Sorted final chunk of {} records in {:.2?}", all_lines.len().to_formatted_string(&Locale::en), sort_timer.elapsed());
+        let mut tmp = tempfile::NamedTempFile::new()?;
+        for l in &all_lines { writeln!(tmp, "{}", l)?; }
+        chunk_files.push(tmp.into_temp_path());
+        log::info!("[mtlog] Wrote sorted chunk file #{} ({} records)", chunk_files.len().to_formatted_string(&Locale::en), all_lines.len().to_formatted_string(&Locale::en));
+    }
+    log::info!("[mtlog] {} sorted chunk files created in {:.2?}", chunk_files.len().to_formatted_string(&Locale::en), chunk_timer.elapsed());
+    log::info!("[mtlog] Total input records: {}", total_records.to_formatted_string(&Locale::en));
+
+    // 2. K-way merge sorted chunks
+    let merge_timer = Instant::now();
+    let mut writer = BufWriter::new(File::create(output_path.as_ref())?);
+    let mut readers: Vec<_> = chunk_files.iter().map(|p| BufReader::new(File::open(p).unwrap())).collect();
+    let mut heap = BinaryHeap::new();
+    let mut merged_count = 0usize;
+    // Prime heap
+    for (idx, rdr) in readers.iter_mut().enumerate() {
+        let mut buf = String::new();
+        if rdr.read_line(&mut buf)? > 0 {
+            let line = buf.trim_end_matches('\n').to_string();
+            heap.push(MTLogHeapItem { line, idx, sort_columns });
+        }
+    }
+    while let Some(MTLogHeapItem { line, idx, .. }) = heap.pop() {
+        writeln!(writer, "{}", line)?;
+        merged_count += 1;
+        if merged_count % 500_000 == 0 {
+            log::info!("[mtlog] Merged {} records so far...", merged_count.to_formatted_string(&Locale::en));
+        }
+        let rdr = &mut readers[idx];
+        let mut buf = String::new();
+        if rdr.read_line(&mut buf)? > 0 {
+            let next_line = buf.trim_end_matches('\n').to_string();
+            heap.push(MTLogHeapItem { line: next_line, idx, sort_columns });
+        }
+    }
     writer.flush()?;
-    let elapsed = start.elapsed();
-    log::info!("[mtlog] Merge complete: {} lines merged into {:?} in {:.2?}", total_lines, output_path.as_ref(), elapsed);
+    log::info!("[mtlog] K-way merge complete: {} records merged in {:.2?}", merged_count.to_formatted_string(&Locale::en), merge_timer.elapsed());
+    log::info!("[mtlog] Merge complete: chunked+sorted into {:?} in {:.2?}", output_path.as_ref(), total_timer.elapsed());
     Ok(())
+}
+
+// Heap item for k-way merge of sorted MT log chunk files
+#[derive(Eq)]
+struct MTLogHeapItem<'a> {
+    line: String,
+    idx: usize,
+    sort_columns: &'a [MTLogSortColumn],
+}
+
+impl<'a> Ord for MTLogHeapItem<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // reverse for min-heap
+        compare_mtlog_by_columns(&other.line, &self.line, self.sort_columns)
+    }
+}
+impl<'a> PartialOrd for MTLogHeapItem<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<'a> PartialEq for MTLogHeapItem<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.line == other.line
+    }
+}
+
+fn compare_mtlog_by_columns(a: &str, b: &str, sort_columns: &[MTLogSortColumn]) -> std::cmp::Ordering {
+    for col in sort_columns {
+        let (v1, v2) = (get_mtlog_field(a, col.index), get_mtlog_field(b, col.index));
+        let ord = match col.col_type {
+            MTLogSortType::Date | MTLogSortType::Time => v1.cmp(&v2),
+            MTLogSortType::Num => v1.parse::<u64>().unwrap_or(0).cmp(&v2.parse::<u64>().unwrap_or(0)),
+            MTLogSortType::Str => v1.cmp(&v2),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// ดึง field จาก fixed-width string ตาม column index
+fn get_mtlog_field(line: &str, col: usize) -> String {
+    // กำหนดตำแหน่งและความยาว field ตาม MTLogRecord (ตัวอย่าง: [start, len])
+    // ต้องตรงกับโครงสร้างจริง!
+    const OFFSETS: &[(usize, usize)] = &[
+        (0,8),    // 0: milog_rec_sys_date
+        (8,6),    // 1: milog_rec_sys_time
+        (14,7),   // 2: milog_rec_taskno
+        (21,4),   // 3: milog_channel_code
+        (25,1),   // 4: milog_rec_rectype
+        (26,8),   // 5: milog_ts_ext_tran_code
+        (34,1),   // 6: milog_tran_type
+        (35,1),   // 7: milog_record_status
+        // ... เพิ่ม field อื่น ๆ ตามต้องการ ...
+    ];
+    if col >= OFFSETS.len() {
+        return String::new();
+    }
+    let (start, len) = OFFSETS[col];
+    line.get(start..start+len).unwrap_or("").trim().to_string()
 }
 
 /// K-way parallel merge of sorted chunk files into a single sorted output CSV.
@@ -495,6 +629,7 @@ pub fn parallel_merge_chunks(
     use std::collections::VecDeque;
     use std::fs::File;
     use std::io::BufReader;
+
     if chunk_paths.is_empty() {
         return Err(anyhow::anyhow!("No chunk files to merge"));
     }
@@ -515,9 +650,12 @@ pub fn parallel_merge_chunks(
 
     // Prepare output writer
     let mut wtr = WriterBuilder::new()
-        .has_headers(true)
+        .has_headers(false)
         .from_path(output_path)?;
-    wtr.write_record(headers.iter())?;
+    // Write header only if this is the final output
+    if output_path.extension().and_then(|s| s.to_str()) == Some("csv") {
+        wtr.write_record(headers.iter())?;
+    }
 
     // Determine sort indices
     let sort_indices = Arc::new(get_sort_column_indices(&headers, sort_columns));
