@@ -11,6 +11,7 @@ use std::time::Instant;
 use rayon::slice::ParallelSliceMut;
 use split_merge_hub_demo::parallel_merge::*;
 
+
 /// A tool for splitting and merging CSV files with parallel processing
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
