@@ -169,11 +169,11 @@ fn main() {
         || generate_mt_log_file_parallel(&file2, rows_per_file),
     );
     let elapsed = start.elapsed();
-    println!("\n✅ Successfully generated 2 MT log files in '{}' directory", output_dir);
-    println!("   - {}", file1);
-    println!("   - {}", file2);
-    println!("   Total rows per file: {}", rows_per_file);
-    println!("   Elapsed: {:.2?}", elapsed);
+    info!("\n✅ Successfully generated 2 MT log files in '{}' directory", output_dir);
+    info!("   - {}", file1);
+    info!("   - {}", file2);
+    info!("   Total rows per file: {}", rows_per_file);
+    info!("   Elapsed: {:.2?}", elapsed);
 }
 
 fn generate_mt_log_file_parallel(file_path: &str, rows: usize) {
@@ -200,8 +200,8 @@ fn generate_mt_log_file_parallel(file_path: &str, rows: usize) {
             .expect("Open for append").write_all(&buf)
             .expect("Write error");
         let written = counter.fetch_add(end_row - start_row, Ordering::SeqCst) + (end_row - start_row);
-        println!("Batch {} done: {} rows written so far", batch_idx + 1, written);
+        info!("Batch {} done: {} rows written so far", batch_idx + 1, written);
     });
     let elapsed = start.elapsed();
-    println!("{}: done {} rows in {:.2?}", file_path, rows, elapsed);
+    info!("{}: done {} rows in {:.2?}", file_path, rows, elapsed);
 }
