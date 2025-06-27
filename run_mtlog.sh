@@ -112,16 +112,29 @@ if command -v du &> /dev/null; then
     FILE_SIZE=$(du -h "$OUTPUT_FILE" 2>/dev/null | cut -f1 || echo "unknown")
 fi
 
+# Format number with comma
+format_number() {
+    if command -v numfmt &> /dev/null; then
+        numfmt --grouping "$1"
+    else
+        printf "%'d\n" "$1"
+    fi
+}
+
 # Count number of rows (lines) in output file (by new line)
 LINE_COUNT=$(wc -l < "$OUTPUT_FILE")
+LINE_COUNT_FMT=$(format_number "$LINE_COUNT")
+
+# Format total input size (bytes) with comma
+TOTAL_INPUT_SIZE_FMT=$(format_number "$TOTAL_INPUT_SIZE")
 
 # Display summary
 cat <<EOF
 ==== Merge Summary ====
    Output file: $OUTPUT_FILE
    File size:  $FILE_SIZE
-   Total records:  $LINE_COUNT
-   Total input size: $HUMAN_SIZE
+   Total records:  $LINE_COUNT_FMT
+   Total input size: $TOTAL_INPUT_SIZE_FMT bytes
    Duration: ${DURATION_SEC}s (${DURATION_MIN} min)
 EOF
 
