@@ -14,7 +14,7 @@ MERGE_K="12"  # Default k-way merge factor; adjust as needed for your hardware
 export RUST_LOG_STYLE="always"
 export RUST_LOG="debug"
 export MERGE_K
-export MERGE_BUF_MB=512
+export MERGE_BUF_MB=256
 export MERGE_PARALLEL_GROUPS=4
 
 export CHUNK_RECORDS=500000
